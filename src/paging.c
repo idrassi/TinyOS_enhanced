@@ -342,13 +342,12 @@ uint32_t map_mmio(uint32_t phys_addr, uint32_t size) {
  * 2. Use software checks in syscall handlers
  * 3. Consider enabling PAE mode for NX bit support
  *=============================================================================*/
-void map_page(uint32_t virtual_addr, uint32_t physical_addr, uint32_t flags) {
+void map_page(uint32_t virtual_addr, uint32_t physical_addr, uint64_t flags) {
     /*=========================================================================
      * PAE MODE: Delegate to PAE mapping function
      *=========================================================================*/
     if (pae_is_active()) {
-        /* Convert 32-bit flags to 64-bit PAE flags (bits are in same positions) */
-        uint64_t pae_flags = (uint64_t)flags;
+        uint64_t pae_flags = flags & PAE_FLAGS_MASK;
 
         /* Check if we're mapping into a user PDPT (CR3 != kernel CR3) */
         uint32_t current_cr3;
@@ -369,6 +368,7 @@ void map_page(uint32_t virtual_addr, uint32_t physical_addr, uint32_t flags) {
     /*=========================================================================
      * STANDARD 32-BIT MODE: Use recursive paging
      *=========================================================================*/
+    uint32_t legacy_flags = (uint32_t)(flags & 0xFFFu);
     uint32_t pd_index = virtual_addr >> 22;
     uint32_t pt_index = (virtual_addr >> 12) & 0x3FF;
 
@@ -405,7 +405,7 @@ void map_page(uint32_t virtual_addr, uint32_t physical_addr, uint32_t flags) {
 
         // Set up the page directory entry
         uint32_t pt_flags = PAGE_PRESENT | PAGE_READWRITE;
-        if (flags & PAGE_USER) {
+        if (legacy_flags & PAGE_USER) {
             pt_flags |= PAGE_USER;  // If mapping user page, PT must be user-accessible
         }
 
@@ -434,9 +434,9 @@ void map_page(uint32_t virtual_addr, uint32_t physical_addr, uint32_t flags) {
 
     // Map the page
     uint32_t* pte = (uint32_t*)(0xffc00000 + (pd_index * 0x1000)) + pt_index;
-    // kprintf("  Setting PTE[%d] = 0x%08x\n", pt_index, physical_addr | flags);
+    // kprintf("  Setting PTE[%d] = 0x%08x\n", pt_index, physical_addr | legacy_flags);
 
-    *pte = physical_addr | flags;
+    *pte = physical_addr | legacy_flags;
 
     // Flush TLB - memory clobber prevents compiler reordering across TLB invalidation
     asm volatile("invlpg (%0)" : : "r" (virtual_addr) : "memory");
@@ -729,8 +729,8 @@ uint32_t* get_page_table_entry(uint32_t virtual_addr) {
  *=============================================================================*/
 
 // Map memory accessible from user mode
-void map_user_memory(uint32_t virtual_addr, uint32_t physical_addr, uint32_t flags) {
-    kprintf("map_user_memory: virt=0x%08x -> phys=0x%08x, flags=0x%x\n", 
+void map_user_memory(uint32_t virtual_addr, uint32_t physical_addr, uint64_t flags) {
+    kprintf("map_user_memory: virt=0x%08x -> phys=0x%08x, flags=0x%016llx\n",
            virtual_addr, physical_addr, flags);
     
     // Ensure user flag is set
@@ -836,7 +836,7 @@ bool setup_user_process_paging(uint32_t code_phys_addr, size_t code_size) {
     kprintf("3. Mapping user stack...\n");
     uint32_t stack_virt = USER_STACK_BASE - 4096;
     kprintf("   Stack virt: 0x%08x -> phys: 0x%08x\n", stack_virt, stack_phys);
-    map_user_memory(stack_virt, stack_phys, PAGE_PRESENT | PAGE_READWRITE | PAGE_USER);
+    map_user_memory(stack_virt, stack_phys, PAE_PAGE_STACK);
     kprintf("   Stack mapped successfully\n");
     
     kprintf("=== setup_user_process_paging COMPLETE ===\n");
@@ -1190,5 +1190,3 @@ void free_page_directory(uint32_t page_dir_phys) {
     pmm_free(page_dir_phys);
     kprintf("[PAGING] Page directory freed\n");
 }
-
-

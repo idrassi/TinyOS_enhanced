@@ -59,7 +59,7 @@ void paging_identity_map_early(uint32_t limit_bytes);
 void paging_enable(void);
 
 uint32_t map_mmio(uint32_t phys_addr, uint32_t size);
-void map_page(uint32_t virt, uint32_t phys, uint32_t flags);
+void map_page(uint32_t virt, uint32_t phys, uint64_t flags);
 void unmap_page(uint32_t virt);
 void unmap_page_range(uint32_t vaddr_start, uint32_t vaddr_end);
 void flush_tlb_single(uint32_t virt);
@@ -76,7 +76,7 @@ bool validate_memory_range(uint32_t addr, uint32_t size, bool require_write);
 uint32_t* get_page_table_entry(uint32_t virtual_addr);
 
 // Only need these core functions to get user mode working
-void map_user_memory(uint32_t virtual_addr, uint32_t physical_addr, uint32_t flags);
+void map_user_memory(uint32_t virtual_addr, uint32_t physical_addr, uint64_t flags);
 bool setup_user_process_paging(uint32_t code_phys_addr, size_t code_size);
 void unmap_user_memory(uint32_t virtual_addr);
 // Utility functions

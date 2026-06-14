@@ -1000,14 +1000,16 @@ int task_create_user_ex(uint32_t entry, const char* name, uint16_t stack_pages) 
      * stays recorded so the #PF handler can still recognise a stack-overflow
      * hit on the guard page. */
     uint32_t user_guard_virt = stack_base - ((stack_pages + 1) * 0x1000);
-    map_page(user_guard_virt, user_guard_page_phys, PAGE_PRESENT | PAGE_READWRITE | PAGE_USER);
-    map_page(user_guard_virt, user_guard_page_phys, PAGE_READWRITE | PAGE_USER);  // Present=0
+    uint64_t user_stack_flags = PAE_PAGE_STACK;
+    map_page(user_guard_virt, user_guard_page_phys, user_stack_flags);
+    map_page(user_guard_virt, user_guard_page_phys,
+             (user_stack_flags & ~PAGE_PRESENT));  // Present=0
     flush_tlb_single(user_guard_virt);
 
     /* Map user stack pages into USER page directory (virtual -> physical) */
     for (int i = 0; i < stack_pages; i++) {
         uint32_t virt_addr = stack_base - ((i + 1) * 0x1000);  /* Top-down from stack_base */
-        map_page(virt_addr, task->user_stack_pages_phys[i], PAGE_PRESENT | PAGE_READWRITE | PAGE_USER);
+        map_page(virt_addr, task->user_stack_pages_phys[i], user_stack_flags);
     }
 
     /*=========================================================================
