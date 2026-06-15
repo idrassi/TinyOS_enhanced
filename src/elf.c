@@ -758,12 +758,27 @@ int elf_load_process(const void* elf_data, size_t elf_size, const char* name) {
          * - PaX Project: PAGEEXEC and SEGMEXEC
          *=====================================================================*/
 
-        /* Convert ELF p_flags to x86 page table flags */
-        uint32_t page_flags = 0x1 | 0x4;  /* PAGE_PRESENT | PAGE_USER (always set) */
-        if (p_flags & 0x2) {  /* PF_W: Writable */
-            page_flags |= 0x2;  /* PAGE_READWRITE */
+        if ((p_flags & PF_W) && (p_flags & PF_X)) {
+            kprintf("[ELF] ERROR: Rejecting writable+executable LOAD segment %d (p_flags=0x%x)\n",
+                    i, p_flags);
+            for (uint32_t j = 0; j < num_allocated; j++) {
+                pmm_free(allocated_frames[j]);
+            }
+            unmap_page_range(USER_MIN_ADDR, max_vaddr);
+            __asm__ volatile("mov %0, %%cr3" :: "r"(kernel_cr3) : "memory");
+            return -1;
         }
-        /* Note: PF_X (executable) cannot be enforced on x86-32 without PAE/NX bit */
+
+        /* Convert ELF p_flags to page table flags.
+         * In PAE mode, NX is the hardware execute-disable bit; legacy 32-bit
+         * paging silently ignores it in map_page(). */
+        uint64_t page_flags = PAGE_PRESENT | PAGE_USER;
+        if (p_flags & PF_W) {
+            page_flags |= PAGE_READWRITE;
+        }
+        if (!(p_flags & PF_X)) {
+            page_flags |= PAE_NX;
+        }
 
         /*=====================================================================
          * SECURITY FIX (AUDIT 10D): Correct ELF Segment Page Alignment
@@ -867,7 +882,7 @@ int elf_load_process(const void* elf_data, size_t elf_size, const char* name) {
         /* Calculate number of pages from address range */
         uint32_t num_pages = (end_page - start_page) / 0x1000;
 
-        kprintf("[ELF] Loading segment %d: vaddr=0x%08x, pages=%d, flags=0x%x (p_flags=0x%x)\n",
+        kprintf("[ELF] Loading segment %d: vaddr=0x%08x, pages=%d, flags=0x%016llx (p_flags=0x%x)\n",
                 i, vaddr, num_pages, page_flags, p_flags);
 
         // Allocate physical pages and map them
@@ -928,8 +943,9 @@ int elf_load_process(const void* elf_data, size_t elf_size, const char* name) {
             allocated_frames[num_allocated++] = phys_frame;
 
             /* Map writable for the copy below (CR0.WP=1 faults supervisor
-             * writes to read-only pages); final permissions applied after. */
-            map_page(page_vaddr, phys_frame, page_flags | 0x2);
+             * writes to read-only pages), but keep the temporary load mapping
+             * NX so executable segments are never writable+executable. */
+            map_page(page_vaddr, phys_frame, page_flags | PAGE_READWRITE | PAE_NX);
         }
 
         // Copy segment data from ELF file to memory
@@ -988,7 +1004,7 @@ int elf_load_process(const void* elf_data, size_t elf_size, const char* name) {
 
         /* SECURITY: Re-map non-writable segments with final permissions,
          * dropping the temporary RW bit used for the copy above. */
-        if (!(p_flags & 0x2)) {
+        if (!(p_flags & PF_W)) {
             for (uint32_t page = 0; page < num_pages; page++) {
                 uint32_t page_vaddr = start_page + (page * 0x1000);
                 map_page(page_vaddr, allocated_frames[seg_first_frame + page],
