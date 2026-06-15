@@ -74,8 +74,8 @@ static void cmd_ps(void) {
     // For now, just show current process
     int pid = getpid();
 
-    write("", 0);  // Placeholder - kernel would need to expose process list
-    write("Currently running in PID: ", 26);
+    write(1, "", 0);  // Placeholder - kernel would need to expose process list
+    write(1, "Currently running in PID: ", 26);
 
     // Convert PID to string
     char pid_str[12];
@@ -139,7 +139,7 @@ static void parse_command(const char* cmd) {
     }
     else {
         puts("Unknown command: ");
-        write(cmd, strlen(cmd));
+        write(1, cmd, strlen(cmd));
         puts("Type 'help' for available commands\n");
     }
 }
