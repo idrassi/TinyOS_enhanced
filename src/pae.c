@@ -138,6 +138,45 @@ static uint32_t kernel_pdpt_phys = 0;
  * Helper Functions
  *===========================================================================*/
 
+#define PAE_CR3_PDPT_MASK 0xFFFFFFE0u  /* PAE CR3 points to a 32-byte-aligned PDPT */
+
+static inline uint32_t pae_read_cr3_pdpt(void) {
+    uint32_t cr3;
+    __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
+    return cr3 & PAE_CR3_PDPT_MASK;
+}
+
+static uint32_t pae_default_pdpt_phys(void) {
+    if (kernel_pdpt_phys == 0) {
+        return 0;  /* Early PAE init: use the static kernel tables directly */
+    }
+
+    uint32_t cr3_pdpt = pae_read_cr3_pdpt();
+    return cr3_pdpt ? cr3_pdpt : kernel_pdpt_phys;
+}
+
+static bool pae_is_kernel_pdpt(uint32_t pdpt_phys) {
+    return pdpt_phys == 0 ||
+           (kernel_pdpt_phys != 0 &&
+            ((pdpt_phys & PAE_CR3_PDPT_MASK) == kernel_pdpt_phys));
+}
+
+static pae_pdpte_t* pae_pdpt_from_phys(uint32_t pdpt_phys) {
+    if (pae_is_kernel_pdpt(pdpt_phys)) {
+        return pdpt;
+    }
+
+    return (pae_pdpte_t*)(uintptr_t)(pdpt_phys & PAE_CR3_PDPT_MASK);
+}
+
+static uint64_t pae_pt_phys_from_ptr(pae_pte_t* pt) {
+    uint32_t pt_addr = (uint32_t)(uintptr_t)pt;
+    if (pt_addr >= KERNEL_BASE) {
+        return (uint64_t)(pt_addr - KERNEL_BASE) & PAE_FRAME_MASK;
+    }
+    return (uint64_t)pt_addr & PAE_FRAME_MASK;
+}
+
 /**
  * @brief Read TSC (Time Stamp Counter) for inline assembly operations
  */
@@ -555,105 +594,90 @@ void pae_init(void) {
  * PAE Page Mapping Functions
  *===========================================================================*/
 
-pae_pte_t* pae_get_pte(uint32_t virt) {
+static pae_pde_t* pae_get_pde_by_index_in(uint32_t pdpt_phys,
+                                           uint32_t pdpt_idx,
+                                           uint32_t pd_idx) {
     if (!pae_active) {
         return NULL;
     }
 
-    /* Extract indices from virtual address */
-    uint32_t pdpt_idx = PAE_PDPT_INDEX(virt);
-    uint32_t pd_idx = PAE_PD_INDEX(virt);
-    uint32_t pt_idx = PAE_PT_INDEX(virt);
+    if (pdpt_idx >= PAE_PDPT_ENTRIES || pd_idx >= PAE_PD_ENTRIES) {
+        return NULL;
+    }
+
+    pae_pdpte_t* target_pdpt = pae_pdpt_from_phys(pdpt_phys);
 
     /* Check PDPT entry */
-    if (!(pdpt[pdpt_idx] & PAE_PRESENT)) {
+    if (!(target_pdpt[pdpt_idx] & PAE_PRESENT)) {
         return NULL;  /* PDPT entry not present */
     }
 
     /* Get page directory */
-    pae_pde_t* pd = page_directories[pdpt_idx];
+    uint64_t pd_phys = target_pdpt[pdpt_idx] & PAE_FRAME_MASK;
+    pae_pde_t* pd = (pae_pde_t*)(uintptr_t)pd_phys;
+
+    return &pd[pd_idx];
+}
+
+pae_pde_t* pae_get_pde_in(uint32_t pdpt_phys, uint32_t virt) {
+    return pae_get_pde_by_index_in(pdpt_phys,
+                                   PAE_PDPT_INDEX(virt),
+                                   PAE_PD_INDEX(virt));
+}
+
+pae_pde_t* pae_get_pde(uint32_t virt, uint32_t pdpt_index) {
+    return pae_get_pde_by_index_in(pae_default_pdpt_phys(),
+                                   pdpt_index,
+                                   PAE_PD_INDEX(virt));
+}
+
+pae_pte_t* pae_get_pte_in(uint32_t pdpt_phys, uint32_t virt) {
+    if (!pae_active) {
+        return NULL;
+    }
+
+    uint32_t pt_idx = PAE_PT_INDEX(virt);
+    pae_pde_t* pde = pae_get_pde_in(pdpt_phys, virt);
 
     /* Check PD entry */
-    if (!(pd[pd_idx] & PAE_PRESENT)) {
+    if (!pde || !(*pde & PAE_PRESENT)) {
         return NULL;  /* Page directory entry not present */
     }
 
     /* Get page table from PD entry */
-    uint64_t pt_phys = pd[pd_idx] & PAE_FRAME_MASK;
+    uint64_t pt_phys = *pde & PAE_FRAME_MASK;
     pae_pte_t* pt = (pae_pte_t*)(uintptr_t)pt_phys;  /* Identity mapped */
 
     /* Return pointer to PTE */
     return &pt[pt_idx];
 }
 
+pae_pte_t* pae_get_pte(uint32_t virt) {
+    return pae_get_pte_in(pae_default_pdpt_phys(), virt);
+}
+
 void pae_map_page(uint32_t virt, uint64_t phys, uint64_t flags) {
+    pae_map_page_into(kernel_pdpt_phys, virt, phys, flags);
+}
+
+void pae_unmap_page_in(uint32_t pdpt_phys, uint32_t virt) {
     if (!pae_active) {
-        kprintf("[PAE] WARNING: PAE not active, cannot map\n");
         return;
     }
 
     CRITICAL_SECTION_ENTER();
 
-    /* Extract indices */
-    uint32_t pdpt_idx = PAE_PDPT_INDEX(virt);
-    uint32_t pd_idx = PAE_PD_INDEX(virt);
-    uint32_t pt_idx = PAE_PT_INDEX(virt);
-
-    /* Ensure PDPT entry is present */
-    if (!(pdpt[pdpt_idx] & PAE_PRESENT)) {
-        kprintf("[PAE] ERROR: PDPT[%u] not present\n", pdpt_idx);
-        CRITICAL_SECTION_EXIT();
-        return;
-    }
-
-    /* Get page directory */
-    pae_pde_t* pd = page_directories[pdpt_idx];
-
-    /* Allocate page table if needed */
-    if (!(pd[pd_idx] & PAE_PRESENT)) {
-        pae_pte_t* new_pt = alloc_initial_pt();
-        if (!new_pt) {
-            kprintf("[PAE] ERROR: Out of page tables\n");
-            CRITICAL_SECTION_EXIT();
-            return;
-        }
-
-        /* Point PD entry to new page table */
-        uint64_t pt_phys = (uint64_t)(uintptr_t)new_pt;
-        /*=====================================================================
-         * SECURITY FIX (Issue 7.1): Use atomic write for PDE entry
-         *===================================================================*/
-        pae_atomic_write_pde(&pd[pd_idx], pt_phys | PAE_PRESENT | PAE_READWRITE | PAE_USER);
-    }
-
-    /* Get page table */
-    uint64_t pt_phys = pd[pd_idx] & PAE_FRAME_MASK;
-    pae_pte_t* pt = (pae_pte_t*)(uintptr_t)pt_phys;
-
-    /* Set PTE */
-    /*=========================================================================
-     * SECURITY FIX (Issue 7.1): Use atomic write for 64-bit PTE entry
-     * Critical for preventing page table corruption during interrupt
-     *=======================================================================*/
-    pae_atomic_write_pte(&pt[pt_idx], (phys & PAE_FRAME_MASK) | (flags & PAE_FLAGS_MASK));
-
-    /* Flush TLB for this page (only if paging is enabled) */
-    uint32_t cr0;
-    __asm__ volatile("mov %%cr0, %0" : "=r"(cr0));
-    if (cr0 & (1 << 31)) {  /* Check CR0.PG bit */
-        __asm__ volatile("invlpg (%0)" :: "r"(virt) : "memory");
-    }
-
-    CRITICAL_SECTION_EXIT();
-}
-
-void pae_unmap_page(uint32_t virt) {
-    pae_pte_t* pte = pae_get_pte(virt);
+    pae_pte_t* pte = pae_get_pte_in(pdpt_phys, virt);
     if (!pte) {
+        CRITICAL_SECTION_EXIT();
         return;  /* Not mapped */
     }
 
-    CRITICAL_SECTION_ENTER();
+    if (*pte & PAE_SEALED) {
+        kprintf("[MSEAL] DENIED: refusing to unmap sealed page 0x%08x\n", virt);
+        CRITICAL_SECTION_EXIT();
+        return;
+    }
 
     /* Clear PTE */
     /*=========================================================================
@@ -668,8 +692,12 @@ void pae_unmap_page(uint32_t virt) {
     CRITICAL_SECTION_EXIT();
 }
 
-uint64_t pae_virt_to_phys(uint32_t virt) {
-    pae_pte_t* pte = pae_get_pte(virt);
+void pae_unmap_page(uint32_t virt) {
+    pae_unmap_page_in(pae_default_pdpt_phys(), virt);
+}
+
+uint64_t pae_virt_to_phys_in(uint32_t pdpt_phys, uint32_t virt) {
+    pae_pte_t* pte = pae_get_pte_in(pdpt_phys, virt);
     if (!pte || !(*pte & PAE_PRESENT)) {
         return 0;  /* Not mapped */
     }
@@ -679,6 +707,10 @@ uint64_t pae_virt_to_phys(uint32_t virt) {
     uint32_t offset = PAE_PAGE_OFFSET(virt);
 
     return phys_frame | offset;
+}
+
+uint64_t pae_virt_to_phys(uint32_t virt) {
+    return pae_virt_to_phys_in(pae_default_pdpt_phys(), virt);
 }
 
 /*=============================================================================
@@ -757,7 +789,7 @@ uint32_t pae_wx_audit(void) {
  * Debugging Functions
  *===========================================================================*/
 
-void pae_dump_tables(uint32_t virt) {
+void pae_dump_tables_in(uint32_t pdpt_phys, uint32_t virt) {
     if (!pae_active) {
         kprintf("[PAE] PAE not active\n");
         return;
@@ -774,8 +806,10 @@ void pae_dump_tables(uint32_t virt) {
     kprintf("Offset:     0x%03x\n", PAE_PAGE_OFFSET(virt));
     kprintf("\n");
 
+    pae_pdpte_t* target_pdpt = pae_pdpt_from_phys(pdpt_phys);
+
     /* PDPT Entry */
-    pae_pdpte_t pdpte = pdpt[pdpt_idx];
+    pae_pdpte_t pdpte = target_pdpt[pdpt_idx];
     kprintf("PDPT[%u]: 0x%016llx\n", pdpt_idx, pdpte);
     kprintf("  Present: %s\n", (pdpte & PAE_PRESENT) ? "Yes" : "No");
 
@@ -785,7 +819,8 @@ void pae_dump_tables(uint32_t virt) {
     }
 
     /* PD Entry */
-    pae_pde_t* pd = page_directories[pdpt_idx];
+    uint64_t pd_phys = pdpte & PAE_FRAME_MASK;
+    pae_pde_t* pd = (pae_pde_t*)(uintptr_t)pd_phys;
     pae_pde_t pde = pd[pd_idx];
     kprintf("PD[%u]:   0x%016llx\n", pd_idx, pde);
     kprintf("  Present: %s\n", (pde & PAE_PRESENT) ? "Yes" : "No");
@@ -810,10 +845,15 @@ void pae_dump_tables(uint32_t virt) {
     kprintf("  Writable:   %s\n", (pte & PAE_READWRITE) ? "Yes" : "No");
     kprintf("  User:       %s\n", (pte & PAE_USER) ? "Yes" : "No");
     kprintf("  Executable: %s\n", (pte & PAE_NX) ? "No (NX set)" : "Yes");
+    kprintf("  Sealed:     %s\n", (pte & PAE_SEALED) ? "Yes" : "No");
     kprintf("  Phys Frame: 0x%012llx\n", pte & PAE_FRAME_MASK);
 
-    uint64_t final_phys = pae_virt_to_phys(virt);
+    uint64_t final_phys = pae_virt_to_phys_in(pdpt_phys, virt);
     kprintf("\nFinal physical address: 0x%012llx\n\n", final_phys);
+}
+
+void pae_dump_tables(uint32_t virt) {
+    pae_dump_tables_in(pae_default_pdpt_phys(), virt);
 }
 
 /*=============================================================================
@@ -1024,126 +1064,94 @@ void pae_free_user_pdpt(uint32_t pdpt_phys) {
  * @param flags Page flags (including potential NX bit)
  *===========================================================================*/
 void pae_map_page_into(uint32_t pdpt_phys, uint32_t virt, uint64_t phys, uint64_t flags) {
-    /* Calculate indices */
+    if (!pae_active) {
+        kprintf("[PAE] WARNING: PAE not active, cannot map\n");
+        return;
+    }
+
     uint32_t pdpt_idx = PAE_PDPT_INDEX(virt);
     uint32_t pd_idx = PAE_PD_INDEX(virt);
     uint32_t pt_idx = PAE_PT_INDEX(virt);
 
-    /*=========================================================================
-     * CRITICAL: Mask physical address to ensure no reserved bits are set
-     * PAE requires bits 12-51 only for physical address, bits 62:52 reserved
-     *=========================================================================*/
-    phys = phys & 0x000FFFFFFFFFF000ULL;  /* Clear bits 0-11, 52-63 */
-    flags = flags & 0x8000000000000FFFULL; /* Keep only valid flag bits */
+    /* PAE requires bits 12-51 only for physical address; bits 62:52 are reserved. */
+    phys &= PAE_FRAME_MASK;
+    flags &= PAE_FLAGS_MASK;
 
-    /* Access the target PDPT (should be identity-mapped - all RAM is mapped) */
-    pae_pdpte_t* target_pdpt = (pae_pdpte_t*)(uintptr_t)pdpt_phys;
+    bool target_is_kernel = pae_is_kernel_pdpt(pdpt_phys);
+    pae_pdpte_t* target_pdpt = pae_pdpt_from_phys(pdpt_phys);
 
-    /* Get the page directory from the PDPT */
+    CRITICAL_SECTION_ENTER();
+
     if (!(target_pdpt[pdpt_idx] & PAE_PRESENT)) {
         kprintf("[PAE] ERROR: PDPT[%u] not present in target PDPT\n", pdpt_idx);
+        CRITICAL_SECTION_EXIT();
         return;
     }
 
     uint64_t pd_phys = target_pdpt[pdpt_idx] & PAE_FRAME_MASK;
     pae_pde_t* target_pd = (pae_pde_t*)(uintptr_t)pd_phys;
-
-    /* Get or create page table */
-    pae_pte_t* pt;          /* Virtual address for accessing page table */
-    uint64_t pt_phys_addr;  /* Physical address for storing in PDE */
+    pae_pte_t* pt = NULL;
 
     if (target_pd[pd_idx] & PAE_PRESENT) {
-        /* Page table exists - get its physical address from PDE */
-        pt_phys_addr = target_pd[pd_idx] & PAE_FRAME_MASK;
+        uint64_t pt_phys_addr = target_pd[pd_idx] & PAE_FRAME_MASK;
 
-        /*=====================================================================
-         * COPY-ON-WRITE of a KERNEL-SHARED page table.
-         *
-         * pae_create_user_pdpt() copies ALL of the kernel's PD[0] entries into
-         * the user PDPT by value, so user PD[0] slots point at the SAME physical
-         * page-table frames the kernel uses for its identity map. Userspace is
-         * linked at 0x08000000 (PD[0][64]) — inside that identity-mapped range —
-         * so writing the user's PTE straight into target_pd[pd_idx] here would
-         * clobber the KERNEL's identity mapping of those frames. The kernel then
-         * accesses pmm_alloc'd memory (RAMFS/FAT32 nodes, exec_buffer) through the
-         * corrupted PT and reads/writes the wrong physical frame -> intermittent
-         * FS corruption (flaky ls), ELF hash mismatch, and memset page faults.
-         *
-         * Fix: if this PDE still points at the kernel's shared PT for this slot,
-         * clone it into a fresh PRIVATE page table for this address space, copy
-         * the existing (kernel) entries, repoint the user PDE, and write into the
-         * private copy. The kernel identity map is left untouched.
-         *===================================================================*/
+        /* If a user PDPT still points at a kernel-shared PT, clone it before
+         * writing the user mapping so kernel identity mappings are not changed. */
         uint64_t kernel_pde = page_directories[pdpt_idx][pd_idx];
         bool shared_with_kernel =
+            !target_is_kernel &&
             (kernel_pde & PAE_PRESENT) &&
             ((kernel_pde & PAE_FRAME_MASK) == (target_pd[pd_idx] & PAE_FRAME_MASK));
 
         if (shared_with_kernel) {
-            pae_pte_t* priv = alloc_initial_pt();  /* zeroed PT, usable vaddr */
+            pae_pte_t* priv = alloc_initial_pt();
             if (priv == NULL) {
                 kprintf("[PAE] ERROR: COW page-table alloc failed for PD[%u]\n", pd_idx);
+                CRITICAL_SECTION_EXIT();
                 return;
             }
-            /* Copy the kernel PT entries into the private copy so existing
-             * mappings in this 2 MB window survive. */
+
             pae_pte_t* shared_pt = (pae_pte_t*)(uintptr_t)pt_phys_addr;
             for (int e = 0; e < PAE_PT_ENTRIES; e++) {
                 priv[e] = shared_pt[e];
             }
-            /* Physical address of the private PT (static-array vs PMM frame,
-             * same convention as the allocate-new branch below). */
-            uint32_t priv_addr = (uint32_t)(uintptr_t)priv;
-            uint64_t priv_phys = (priv_addr >= KERNEL_BASE)
-                                     ? (uint64_t)(priv_addr - KERNEL_BASE)
-                                     : (uint64_t)priv_addr;
-            priv_phys &= 0x000FFFFFFFFFF000ULL;
+
             pae_atomic_write_pde(&target_pd[pd_idx],
-                                 priv_phys | (PAE_PRESENT | PAE_READWRITE | PAE_USER));
+                                 pae_pt_phys_from_ptr(priv) |
+                                 PAE_PRESENT | PAE_READWRITE | PAE_USER);
             pt = priv;
         } else {
-            /* Already a private PT for this address space - access directly. */
             pt = (pae_pte_t*)(uintptr_t)pt_phys_addr;
         }
     } else {
-        /* Need to allocate a new page table */
         pae_pte_t* pt_alloc = alloc_initial_pt();
         if (pt_alloc == NULL) {
             kprintf("[PAE] ERROR: Failed to allocate page table for PD[%u]\n", pd_idx);
+            CRITICAL_SECTION_EXIT();
             return;
         }
 
-        /* Determine physical address for PDE and virtual address for access */
-        uint32_t pt_addr = (uint32_t)(uintptr_t)pt_alloc;
-
-        if (pt_addr >= KERNEL_BASE) {
-            /* Static kernel array - convert to physical for PDE */
-            pt_phys_addr = (uint64_t)(pt_addr - KERNEL_BASE);
-            /* But use original virtual address for access (kernel mappings copied to user PDPT) */
-            pt = pt_alloc;
-        } else {
-            /* Already physical address from PMM (all RAM is identity-mapped) */
-            pt_phys_addr = (uint64_t)pt_addr;
-            /* Can access via identity mapping */
-            pt = pt_alloc;
-        }
-
-        /* Mask and align physical address, then set PDE */
-        pt_phys_addr = pt_phys_addr & 0x000FFFFFFFFFF000ULL;
-        /*=====================================================================
-         * SECURITY FIX (Issue 7.1): Use atomic write for PDE entry
-         *===================================================================*/
-        pae_atomic_write_pde(&target_pd[pd_idx], pt_phys_addr | (PAE_PRESENT | PAE_READWRITE | PAE_USER));
+        pt = pt_alloc;
+        pae_atomic_write_pde(&target_pd[pd_idx],
+                             pae_pt_phys_from_ptr(pt_alloc) |
+                             PAE_PRESENT | PAE_READWRITE | PAE_USER);
     }
 
-    /* Set the page table entry (pt is now guaranteed to be a valid virtual address) */
-    /*=========================================================================
-     * SECURITY FIX (Issue 7.1): Use atomic write for PTE entry
-     *=======================================================================*/
+    if (pt[pt_idx] & PAE_SEALED) {
+        kprintf("[MSEAL] DENIED: refusing to remap sealed page 0x%08x\n", virt);
+        CRITICAL_SECTION_EXIT();
+        return;
+    }
+
     pae_atomic_write_pte(&pt[pt_idx], phys | flags);
 
-    /* Flush TLB for this virtual address */
-    __asm__ volatile("invlpg (%0)" :: "r"(virt) : "memory");
+    uint32_t cr0;
+    __asm__ volatile("mov %%cr0, %0" : "=r"(cr0));
+    if (cr0 & (1 << 31)) {
+        __asm__ volatile("invlpg (%0)" :: "r"(virt) : "memory");
+    }
+
+    CRITICAL_SECTION_EXIT();
 }
 
 /*=============================================================================
@@ -1307,72 +1315,106 @@ bool pae_verify_kernel_layout(void) {
  *===========================================================================*/
 
 /**
- * @brief Seal a memory region, making it permanently immutable
+ * @brief Seal a memory region in a target PDPT, making it permanently immutable
  */
-int pae_seal_memory(uint32_t vaddr_start, uint32_t size) {
-    /* Validate PAE is active */
+int pae_seal_memory_in(uint32_t pdpt_phys, uint32_t vaddr_start, uint32_t size) {
     if (!pae_active) {
         kprintf("[MSEAL] ERROR: PAE not active\n");
         return -1;
     }
 
-    /* Validate alignment */
-    if (vaddr_start % PAGE_SIZE != 0) {
+    if ((vaddr_start & (PAGE_SIZE - 1)) != 0) {
         kprintf("[MSEAL] ERROR: Address 0x%08x not page-aligned\n", vaddr_start);
         return -1;
     }
 
-    /* Round size up to page boundary */
-    uint32_t num_pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
+    if (size == 0) {
+        kprintf("[MSEAL] ERROR: Size must be non-zero\n");
+        return -1;
+    }
+
+    uint32_t end = vaddr_start + size;
+    if (end < vaddr_start) {
+        kprintf("[MSEAL] ERROR: Address range wraps around\n");
+        return -1;
+    }
+
+    uint32_t end_rounded = end;
+    if ((end_rounded & (PAGE_SIZE - 1)) != 0) {
+        if (end_rounded > 0xFFFFFFFFu - (PAGE_SIZE - 1)) {
+            kprintf("[MSEAL] ERROR: Rounded address range wraps around\n");
+            return -1;
+        }
+        end_rounded = (end_rounded + PAGE_SIZE - 1) & PAGE_FRAME_MASK;
+    }
+
+    uint32_t num_pages = (end_rounded - vaddr_start) / PAGE_SIZE;
     kprintf("[MSEAL] Sealing %u pages starting at 0x%08x (size: %u bytes)\n",
             num_pages, vaddr_start, size);
 
-    /* Seal each page in the range */
-    for (uint32_t i = 0; i < num_pages; i++) {
-        uint32_t vaddr = vaddr_start + (i * PAGE_SIZE);
+    CRITICAL_SECTION_ENTER();
 
-        /* Get page table entry */
-        pae_pte_t* pte = pae_get_pte(vaddr);
-        if (!pte) {
+    for (uint32_t vaddr = vaddr_start; vaddr < end_rounded; vaddr += PAGE_SIZE) {
+        pae_pde_t* pde = pae_get_pde_in(pdpt_phys, vaddr);
+        pae_pte_t* pte = pae_get_pte_in(pdpt_phys, vaddr);
+        if (!pde || !(*pde & PAE_PRESENT) ||
+            !pte || !(*pte & PAE_PRESENT)) {
+            CRITICAL_SECTION_EXIT();
             kprintf("[MSEAL] ERROR: Page 0x%08x not mapped\n", vaddr);
             return -1;
         }
 
-        /* Check if page is present */
-        if (!(*pte & PAE_PRESENT)) {
-            kprintf("[MSEAL] ERROR: Page 0x%08x not present\n", vaddr);
+        if (!(*pde & PAE_USER) || !(*pte & PAE_USER)) {
+            CRITICAL_SECTION_EXIT();
+            kprintf("[MSEAL] ERROR: Page 0x%08x is not user-accessible\n", vaddr);
             return -1;
         }
-
-        /* Check if already sealed */
-        if (*pte & PAE_SEALED) {
-            kprintf("[MSEAL] WARNING: Page 0x%08x already sealed\n", vaddr);
-            continue;
-        }
-
-        /* Set sealed flag */
-        *pte |= PAE_SEALED;
-
-        /* Flush TLB for this page */
-        __asm__ volatile("invlpg (%0)" :: "r"(vaddr) : "memory");
     }
+
+    uint32_t cr0;
+    __asm__ volatile("mov %%cr0, %0" : "=r"(cr0));
+
+    for (uint32_t vaddr = vaddr_start; vaddr < end_rounded; vaddr += PAGE_SIZE) {
+        pae_pte_t* pte = pae_get_pte_in(pdpt_phys, vaddr);
+        uint64_t sealed_pte = (*pte | PAE_SEALED) & ~PAE_READWRITE;
+        pae_atomic_write_pte(pte, sealed_pte);
+        if (cr0 & (1 << 31)) {
+            __asm__ volatile("invlpg (%0)" :: "r"(vaddr) : "memory");
+        }
+    }
+
+    CRITICAL_SECTION_EXIT();
 
     kprintf("[MSEAL] Successfully sealed %u pages\n", num_pages);
     return 0;
 }
 
 /**
- * @brief Check if a memory region is sealed
+ * @brief Seal a memory region in the current CR3
  */
-bool pae_is_sealed(uint32_t vaddr) {
+int pae_seal_memory(uint32_t vaddr_start, uint32_t size) {
+    return pae_seal_memory_in(pae_default_pdpt_phys(), vaddr_start, size);
+}
+
+/**
+ * @brief Check if a memory region is sealed in a target PDPT
+ */
+bool pae_is_sealed_in(uint32_t pdpt_phys, uint32_t vaddr) {
     if (!pae_active) {
         return false;
     }
 
-    pae_pte_t* pte = pae_get_pte(vaddr);
+    pae_pte_t* pte = pae_get_pte_in(pdpt_phys, vaddr);
     if (!pte || !(*pte & PAE_PRESENT)) {
         return false;
     }
 
     return (*pte & PAE_SEALED) != 0;
+}
+
+/**
+ * @brief Check if a memory region is sealed in the current CR3
+ */
+bool pae_is_sealed(uint32_t vaddr) {
+    return pae_is_sealed_in(pae_default_pdpt_phys(), vaddr);
 }
