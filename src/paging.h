@@ -144,9 +144,10 @@ typedef uint64_t pae_pdpte_t;  /* Page Directory Pointer Table Entry (64 bits) *
  * - Protects against: mprotect(), munmap(), mremap(), madvise()
  *
  * TINYOS IMPLEMENTATION:
- * - PAE_SEALED flag (bit 9) marks pages as permanently immutable
- * - sys_mseal() sets this flag on specified memory range
- * - Page fault handler enforces: sealed pages reject all modifications
+ * - PAE_SEALED flag (bit 9) marks pages as permanently sealed
+ * - sys_mseal() sets this flag on the calling task's address space
+ * - Sealing clears PAE_READWRITE, so later writes fault in hardware
+ * - PAE map/unmap helpers reject later changes to sealed PTEs
  * - Ideal for code sections after program load
  *
  * SECURITY BENEFITS:
@@ -277,22 +278,45 @@ void pae_map_page(uint32_t virt, uint64_t phys, uint64_t flags);
 void pae_map_page_into(uint32_t pdpt_phys, uint32_t virt, uint64_t phys, uint64_t flags);
 
 /**
+ * @brief Get PAE page directory entry from a specific PDPT
+ * @param pdpt_phys Physical address of the target PDPT
+ * @param virt Virtual address
+ * @return Pointer to PDE, or NULL if not present
+ */
+pae_pde_t* pae_get_pde_in(uint32_t pdpt_phys, uint32_t virt);
+
+/**
+ * @brief Get PAE page table entry from a specific PDPT
+ * @param pdpt_phys Physical address of the target PDPT
+ * @param virt Virtual address
+ * @return Pointer to PTE, or NULL if not mapped
+ */
+pae_pte_t* pae_get_pte_in(uint32_t pdpt_phys, uint32_t virt);
+
+/**
  * @brief Unmap a virtual page in PAE mode
  * @param virt Virtual address to unmap
  */
 void pae_unmap_page(uint32_t virt);
 
 /**
- * @brief Get PAE page table entry for virtual address
+ * @brief Unmap a virtual page from a specific PDPT
+ * @param pdpt_phys Physical address of the target PDPT
+ * @param virt Virtual address to unmap
+ */
+void pae_unmap_page_in(uint32_t pdpt_phys, uint32_t virt);
+
+/**
+ * @brief Get PAE page table entry for virtual address in the current CR3
  * @param virt Virtual address
  * @return Pointer to PTE, or NULL if not mapped
  */
 pae_pte_t* pae_get_pte(uint32_t virt);
 
 /**
- * @brief Get PAE page directory entry
+ * @brief Get PAE page directory entry in the current CR3
  * @param virt Virtual address
- * @param pdpt_index PDPT index (0-3)
+ * @param pdpt_index PDPT index override (0-3)
  * @return Pointer to PDE, or NULL if not present
  */
 pae_pde_t* pae_get_pde(uint32_t virt, uint32_t pdpt_index);
@@ -303,6 +327,14 @@ pae_pde_t* pae_get_pde(uint32_t virt, uint32_t pdpt_index);
  * @return Physical address, or 0 if not mapped
  */
 uint64_t pae_virt_to_phys(uint32_t virt);
+
+/**
+ * @brief Translate virtual to physical address in a specific PDPT
+ * @param pdpt_phys Physical address of the target PDPT
+ * @param virt Virtual address
+ * @return Physical address, or 0 if not mapped
+ */
+uint64_t pae_virt_to_phys_in(uint32_t pdpt_phys, uint32_t virt);
 
 /**
  * @brief Audit memory for W^X violations
@@ -316,6 +348,13 @@ uint32_t pae_wx_audit(void);
  * @param virt Virtual address to dump tables for
  */
 void pae_dump_tables(uint32_t virt);
+
+/**
+ * @brief Print PAE page table structures for a specific PDPT
+ * @param pdpt_phys Physical address of the target PDPT
+ * @param virt Virtual address to dump tables for
+ */
+void pae_dump_tables_in(uint32_t pdpt_phys, uint32_t virt);
 
 /**
  * @brief Verify kernel memory layout for W^X compliance (Issue 12.1)
@@ -349,14 +388,33 @@ bool pae_verify_kernel_layout(void);
  *
  * Once sealed, the region remains immutable until process termination.
  *
+ * @param pdpt_phys Physical address of the target PDPT
  * @param vaddr_start Starting virtual address (must be page-aligned)
  * @param size Size in bytes (will be rounded up to page boundary)
- * @return 0 on success, -1 on error (invalid address, not mapped, already sealed)
+ * @return 0 on success, -1 on error (invalid address, unmapped page, or non-user page)
+ */
+int pae_seal_memory_in(uint32_t pdpt_phys, uint32_t vaddr_start, uint32_t size);
+
+/**
+ * @brief Seal a memory region in the current CR3
+ *
+ * @param vaddr_start Starting virtual address (must be page-aligned)
+ * @param size Size in bytes (will be rounded up to page boundary)
+ * @return 0 on success, -1 on error (invalid address, unmapped page, or non-user page)
  */
 int pae_seal_memory(uint32_t vaddr_start, uint32_t size);
 
 /**
- * @brief Check if a memory region is sealed
+ * @brief Check if a virtual address is sealed in a specific PDPT
+ *
+ * @param pdpt_phys Physical address of the target PDPT
+ * @param vaddr Virtual address to check
+ * @return true if page is sealed, false otherwise
+ */
+bool pae_is_sealed_in(uint32_t pdpt_phys, uint32_t vaddr);
+
+/**
+ * @brief Check if a virtual address is sealed in the current CR3
  *
  * @param vaddr Virtual address to check
  * @return true if page is sealed, false otherwise

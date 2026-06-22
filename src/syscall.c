@@ -998,7 +998,7 @@ int sys_mseal(uint32_t addr, uint32_t size) {
     /*=========================================================================
      * SECURITY: Validate address is in user space
      *=======================================================================*/
-    if (addr >= 0xC0000000) {
+    if (addr >= KERNEL_BASE) {
         kprintf("[SYSCALL] sys_mseal: Cannot seal kernel memory (0x%08x)\n", addr);
         RETURN_ERROR(EINVAL);
     }
@@ -1015,18 +1015,31 @@ int sys_mseal(uint32_t addr, uint32_t size) {
     /*=========================================================================
      * SECURITY: Check for integer overflow
      *=======================================================================*/
-    if (addr + size < addr) {
+    uint32_t end = addr + size;
+    if (end < addr) {
         kprintf("[SYSCALL] sys_mseal: Address range wraps around\n");
         RETURN_ERROR(EINVAL);
     }
 
+    if (end > KERNEL_BASE) {
+        kprintf("[SYSCALL] sys_mseal: Range crosses into kernel memory (0x%08x - 0x%08x)\n",
+                addr, end);
+        RETURN_ERROR(EINVAL);
+    }
+
+    task_t* cur = scheduler_get_current_task();
+    if (!cur || cur->page_directory == 0) {
+        kprintf("[SYSCALL] sys_mseal: No target address space\n");
+        RETURN_ERROR(EPERM);
+    }
+
     /*=========================================================================
-     * Call PAE sealing function
+     * Call PAE sealing function against the calling task's address space
      *=======================================================================*/
     kprintf("[SYSCALL] sys_mseal: Sealing 0x%08x - 0x%08x (%u bytes)\n",
-            addr, addr + size, size);
+            addr, end, size);
 
-    int ret = pae_seal_memory(addr, size);
+    int ret = pae_seal_memory_in(cur->page_directory, addr, size);
     if (ret < 0) {
         kprintf("[SYSCALL] sys_mseal: Failed to seal memory\n");
         RETURN_ERROR(EPERM);
@@ -1035,11 +1048,10 @@ int sys_mseal(uint32_t addr, uint32_t size) {
     /* Null-check current task before dereferencing ->uid, matching the other
      * syscall handlers. Reachable only via int 0x80 from a running task today,
      * so cur is non-NULL in practice — defensive consistency / hardening. */
-    task_t* cur = scheduler_get_current_task();
     uint16_t cur_uid = cur ? cur->uid : 0;
     audit_log(AUDIT_MEMORY_SEAL, AUDIT_INFO, cur_uid,
               "Sealed memory region 0x%08x - 0x%08x",
-              (unsigned int)addr, (unsigned int)(addr + size));
+              (unsigned int)addr, (unsigned int)end);
 
     return 0;
 }

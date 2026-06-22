@@ -8,9 +8,7 @@
 #include "process.h"
 #include "copy_user.h"  /* SECURITY: TOCTOU fix - safe user memory access */
 #include "util.h"       /* For kernel_panic() */
-
-/* Forward declaration for PAE page table dumping */
-extern void pae_dump_tables(uint32_t virt);
+#include "paging.h"     /* PAE page-table helpers */
 
 /* ISR stubs from isr.S */
 extern void isr0(void);  extern void isr1(void);  extern void isr2(void);  extern void isr3(void);
@@ -276,6 +274,12 @@ void page_fault_handler(struct regs* r) {
     if (r->err_code & 0x10) kprintf("Instruction ");
     kprintf("\n");
 
+    if ((r->err_code & 0x03) == 0x03 &&
+        pae_is_active() &&
+        pae_is_sealed(faulting_address)) {
+        kprintf("MSEAL: write denied to sealed page\n");
+    }
+
     /*=========================================================================
      * BUG FIX: Use PAE API instead of recursive mapping
      *
@@ -416,5 +420,4 @@ void general_protection_fault_handler(void) {
     for(;;) __asm__ volatile("hlt");
 }
 */
-
 
