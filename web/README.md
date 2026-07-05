@@ -6,9 +6,11 @@ build step, nothing leaves the visitor's machine. See
 [`../doc/WASM_BROWSER_FEASIBILITY.md`](../doc/WASM_BROWSER_FEASIBILITY.md) for
 the feasibility study and empirical results this demo is based on.
 
-**Live demo:** published via GitHub Pages (repo *Settings → Pages*, source =
-`main` branch, `/web` folder) at
-`https://douglasmun.github.io/TinyOS_enhanced/`.
+**Live demo:** <https://douglasmun.github.io/TinyOS_enhanced/>. This folder is the
+source of truth; GitHub Pages serves from a separate **`gh-pages`** branch (repo
+*Settings → Pages* only allows `/` or `/docs`, not `/web`). To ship a change here,
+copy the updated files to the root of `gh-pages` and push — see "Refreshing the
+deployed site" below.
 
 ## Run locally
 
@@ -58,6 +60,22 @@ The committed ISO carries the same content as the signed `v2.0` release asset
 (SHA-256 `91e6968d93e7887c90b5653f76c0fb4f9ccf674127b2b4df0b38ca187358e834` as of
 2026-07-05). Note `i686-elf-grub-mkrescue` is non-deterministic, so a fresh
 rebuild will hash differently even with identical inputs.
+
+## Refreshing the deployed site
+
+Pages serves the **`gh-pages`** branch (root), not `web/`. After changing a file
+here (e.g. `index.html`) and merging it to `main`, mirror it onto `gh-pages`:
+
+```sh
+git worktree add /tmp/ghp origin/gh-pages
+cp web/index.html /tmp/ghp/index.html          # or the ISO, vendor files, etc.
+git -C /tmp/ghp commit -am "gh-pages: sync index.html"
+git -C /tmp/ghp push origin HEAD:gh-pages
+git worktree remove /tmp/ghp
+```
+
+The branch holds only what the site serves: `index.html`, `tinyos.iso`,
+`vendor/`, and `.nojekyll` (no `README.md`).
 
 ## Known demo limitations
 
