@@ -36,8 +36,8 @@ fault issue — the verify completes and passes.
 Separate from the stack-overflow triple-faults above. `exec /hello.elf` intermittently
 (~1/9 boots) panicked with `Invalid TSS esp0: misaligned pointer` — the user task's
 kernel stack came out as e.g. `0x00398018` (base `0x390018`, low `0x18` bits set),
-which `tss_set_kernel_stack` rejects. Root-caused and fixed 2026-07-05 (branch
-`fix/isr-eax-clobber-tss-panic`, commit `f4e1e52`; **not pushed**).
+which `tss_set_kernel_stack` rejects. Root-caused and fixed 2026-07-05, **merged to
+`main` via PR #11** (merge `f24b391`, fix commit `2247c7b`, doc `ad3f825`).
 
 **Root cause — `src/isr.S` `isr_common` reloaded the kernel data selector
 (`mov ax,0x18`) BEFORE `pusha`.** Any interrupt taken while a live value sat in EAX had

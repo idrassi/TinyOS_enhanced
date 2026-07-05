@@ -1393,8 +1393,15 @@ Hardware-enforced stack-overflow containment and a correct ring-transition path.
   (`SEG_KDATA`) — fixing a latent `#TS` on the first ring3→ring0 transition — and
   `esp0` updates are centralized and validated (NULL / low-memory / misaligned →
   `kernel_panic`), resisting `esp0` corruption (`src/tss.c:83-90, 171-217`).
+- **Interrupt-prologue register integrity:** `isr_common` (`src/isr.S`) runs
+  `pusha` **before** reloading the kernel data selector (`mov ax, SEG_KDATA`), so an
+  interrupt taken with a live value in `EAX` (e.g. `pmm_alloc_contiguous`'s
+  `base<<12` return, used as a kernel-stack base) can no longer have its low word
+  stamped with the selector — which previously produced a misaligned `esp0` and the
+  `kernel_panic` above intermittently on `exec`. A Makefile post-link objdump guard
+  fails the build if this ordering ever regresses.
 
-**Implementation:** `src/process.c`, `src/interrupts.c`, `src/tss.c`.
+**Implementation:** `src/process.c`, `src/interrupts.c`, `src/isr.S`, `src/tss.c`.
 
 ---
 
