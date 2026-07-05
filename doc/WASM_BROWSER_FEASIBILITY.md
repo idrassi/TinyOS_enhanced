@@ -1,8 +1,66 @@
 # Feasibility Study: Running TinyOS in the Browser via WebAssembly
 
 **Date:** 2026-07-05
-**Verdict: Feasible with modest effort**, via the v86 emulator. Not by compiling
-the kernel to WASM directly.
+**Verdict: Feasible — empirically confirmed.** The unmodified `dist/tinyos.iso`
+boots in v86 (headless, Node) all the way to the interactive first-boot password
+prompt. Route: run the v86 emulator (x86→WASM JIT) in the browser and boot the
+existing ISO; **not** by compiling the kernel to WASM directly.
+
+---
+
+## 0. Empirical result (2026-07-05)
+
+Booted `dist/tinyos.iso` in v86 v0.x (npm `v86`, prebuilt `v86.wasm`) headless
+under Node v22, SeaBIOS + VGABIOS ROMs, 256 MB, CD-ROM boot. Captured serial +
+VGA text. Two tests were run:
+
+**Test A — boot to prompt.** Clean boot to the first-boot "Enter new root
+password:" prompt, no panics, no faults.
+
+**Test B — full interactive signed-exec chain (the definitive result).** Drove
+the whole flow via scripted keystrokes (`keyboard_send_text`): first-boot
+password setup (PBKDF2 100k) → root login → shell → `exec /hello.elf` under
+**default ENFORCE signing** (no permissive flag). Result, all from serial:
+
+```
+[ELF] Found signature (offset=13104, elf_size=13104)
+[ELF] Hash verification: PASS
+[ELF] Signature verification: PASS
+[ELF]  Binary 'hello.elf' has valid ECDSA signature
+...
+Hello from ELF!          <- ring-3 syscall output
+ELF program exiting.
+[SYSCALL] Process exited with status 0
+[EXEC] Process completed
+```
+
+**The complete ECDSA P-256 + SHA-256 signed-exec path passed under v86's JIT —
+hash PASS, signature PASS, ring-3 execution, clean exit(0), process reaped,
+user PDPT/page-tables freed, zero triple faults.** This is the exact chain that
+historically triple-faulted on real QEMU before the 2026 fixes; it runs
+correctly in the browser emulator. Test B was CD-only (no HDD image), so FAT32
+C: is unavailable (`[IDE] ERROR: IDE not initialized` — expected, benign); D:
+(RAMFS) works.
+
+Key findings, several of which *overturn* the pre-test predictions below in
+TinyOS's favor:
+
+| Predicted (§4) | Actual in v86 | Evidence (serial) |
+|---|---|---|
+| PAE likely absent → untested fallback path | **PAE fully supported.** Real PAE path runs: CR4.PAE enabled, PDPT at 0x1f1000, 256 MB identity-mapped, "verified complete (no holes)" | `[PAE] CPU supports PAE [OK]` … `[PAE] PAE enabled in CR4 [OK]` |
+| RDRAND/RDSEED absent → weak entropy | **RDRAND supported and healthy.** | `[ENTROPY] RDRAND health check [PASS]` / `Quality: STRONG` |
+| FXSR hard requirement | Satisfied, no panic | Boot proceeds past kernel.c:179-198 |
+| NX optional | **NX unavailable** → graceful "W^X PARTIAL" | `[PAE] NX bit support [UNAVAILABLE]` / `W^X enforcement: PARTIAL` |
+
+Net effect: **Gap 2 (non-PAE fallback risk) is eliminated** — v86 exercises the
+real PAE code path, so the hardened PAE logic (COW page tables, user PDPT, guard
+pages) is what actually runs. The only degradation observed is NX (W^X becomes
+partial), which is expected and non-fatal. GRUB2 El Torito CD boot under v86's
+SeaBIOS **works** (the previously-open mechanical question).
+
+Not yet exercised: completing the password flow, `exec /hello.elf` under
+ENFORCE signing (speed-dependent), FAT32 C: (no IDE disk image attached in this
+test — CD-only boot), and e1000 networking (still absent in v86; see Gap 1).
 
 ---
 
@@ -66,7 +124,7 @@ survey of browser-based x86 emulators as of mid-2026.
 
 | Option | Fit for TinyOS |
 |---|---|
-| **v86** (github.com/copy/v86, BSD, actively maintained) | **Best fit.** i386-only x86→WASM JIT. Pentium-4-level CPU incl. SSE3 (FXSR satisfied). IDE/ATA, ISO-9660 CD, PS/2, VGA text, PIT/PIC, COM1, RTC, PCI all present. NICs: NE2000 + virtio-net (**no e1000**). PAE not documented (treat as absent). No RDRAND/RDSEED. ~10x below native. |
+| **v86** (github.com/copy/v86, BSD, actively maintained) | **Best fit — confirmed booting (§0).** i386-only x86→WASM JIT. Pentium-4-level CPU incl. SSE3 (FXSR satisfied). IDE/ATA, ISO-9660 CD, PS/2, VGA text, PIT/PIC, COM1, RTC, PCI all present. NICs: NE2000 + virtio-net (**no e1000**). **PAE present and RDRAND present** (both empirically verified — docs had understated this). NX absent. ~10x below native. |
 | **Halfix** (github.com/nepx/halfix) | Only browser emulator that names **PAE** support (P4/Core-Duo class, SSE2). But **cannot boot ISOs** (broken ATAPI — HDD images only) and is less maintained. |
 | **qemu-wasm** (github.com/ktock/qemu-wasm) | Experimental (FOSDEM 2025). Targets x86_64/aarch64/riscv64 — **no i386 system emulation demoed**. Requires SharedArrayBuffer/COOP-COEP; TCG-wasm backend not merged upstream. |
 | **CheerpX / WebVM, Boxedwine** | Userspace-only syscall emulation (Linux/Win32 binaries). **Cannot boot a kernel.** Ruled out. |
@@ -93,18 +151,18 @@ networking:
 - write a virtio-net driver (more code, better performance); or
 - contribute e1000 emulation to v86 (Rust, nontrivial).
 
-### Gap 2 — PAE almost certainly absent
-TinyOS degrades gracefully (legacy paging, W^X/NX lost), **but the non-PAE
-fallback is likely the least-tested code path** — all recent hard-won fixes
-(COW of kernel-shared page tables, user PDPT setup, guard pages) live in the
-PAE code. **Pre-flight check:** smoke-test under plain QEMU with PAE masked —
-`-cpu pentium3,-pae` keeps FXSR while dropping PAE — and confirm login +
-`exec /hello.elf` work. If that passes, v86 should too.
+### Gap 2 — PAE ~~almost certainly absent~~ **RESOLVED: PAE present in v86**
+Pre-test this was the top risk. The §0 boot test disproves it: **v86 supports
+PAE**, so TinyOS runs its real, hardened PAE path (CR4.PAE, 256 MB identity map
+verified hole-free), not the legacy fallback. Only NX is missing → W^X degrades
+to "PARTIAL" gracefully, as designed. No pre-flight PAE-masking test needed.
 
-### Gap 3 — No RDRAND + emulation speed
-- RDRAND absence is handled, but entropy on a deterministic emulator is weak.
-  Acceptable for a demo; worth an on-screen banner.
-- v86 is ~an order of magnitude below native, and PBKDF2-100k first-boot
+### Gap 3 — ~~No RDRAND~~ + emulation speed
+- **RDRAND is present in v86** (§0: health check PASS, "Quality: STRONG"), so
+  the weak-entropy concern does not apply on this emulator. (Note: v86's RDRAND
+  is still emulator-generated, not true hardware entropy — fine for a demo.)
+- Speed remains the real practical issue. v86 is ~an order of magnitude below
+  native, and PBKDF2-100k first-boot
   password setup plus bit-serial ECDSA exec verification are already
   minutes-scale under QEMU/TCG. For a browser demo build:
   - compile with `-DTINYOS_FAST_KDF` (explicit, documented opt-out), and
@@ -126,14 +184,21 @@ an offline demo. Natural fit as a "boot TinyOS in your browser" live-demo link
 on the GitHub repo.
 
 **Recommended order:**
-1. Test the current ISO in v86 locally as-is (settles El Torito question).
-2. Smoke-test the non-PAE path under QEMU (`-cpu pentium3,-pae`); fix whatever
-   it shakes out.
-3. Choose demo build flags (`-DTINYOS_FAST_KDF`, signing mode).
-4. *(Optional)* Add an ne2k driver + WISP/fetch proxy config for networking.
+1. ~~Test the current ISO in v86 locally as-is~~ **DONE (§0, Test A)** — boots
+   clean; El Torito + PAE + RDRAND all confirmed working.
+2. ~~Smoke-test the non-PAE path~~ **N/A** — v86 runs the real PAE path.
+3. ~~Drive the full interactive flow (password → login → `exec` under
+   ENFORCE)~~ **DONE (§0, Test B)** — signed exec passes end-to-end, `Hello
+   from ELF!`, exit(0), zero triple faults. Crypto is slow-but-correct under
+   the JIT; a demo build may still want `-DTINYOS_FAST_KDF` purely for
+   password-setup latency, but signing works as-is and need not be disabled.
+4. Attach a FAT32 disk image as an IDE drive and confirm C: mounts (both §0
+   tests were CD-only; C: not yet exercised — D:/RAMFS works).
+5. Wrap in a static web page (v86 + ISO + VGA canvas + serial div).
+6. *(Optional)* Add an ne2k driver + WISP/fetch proxy for networking.
 
-Steps 1–3 are days, not weeks. The NIC driver (step 4) is the only open-ended
-piece.
+Steps 4–5 are days, not weeks. The NIC driver (step 6) is the only open-ended
+piece. **The core feasibility question is now answered empirically: yes.**
 
 ---
 
