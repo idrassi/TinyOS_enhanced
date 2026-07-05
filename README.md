@@ -32,6 +32,14 @@ The cryptography is implemented from scratch for educational purposes and has no
 
 ---
 
+## Run it in your browser (no install)
+
+You can boot TinyOS Enhanced **right in your browser** — it runs on the [v86](https://github.com/copy/v86) x86-to-WebAssembly emulator, so the whole PC is emulated in the tab and nothing leaves your machine:
+
+### 👉 [**douglasmun.github.io/TinyOS_enhanced**](https://douglasmun.github.io/TinyOS_enhanced/)
+
+Press **Start**, click the console, and set a root password; then try `help`, `ls D:`, and `exec /hello.elf`. Crypto (PBKDF2 100k, bit-serial ECDSA) is slow under the emulator's JIT, so first boot and the first `exec` take a little while — a speed cost, not a fault. Limitations: no hard disk (drive **C:** unavailable; **D:** RAMFS works) and no networking. Source for the page is in [`web/`](web/).
+
 ## Try it in 30 seconds (prebuilt demo ISO)
 
 A prebuilt, bootable **demo ISO** is published on the [**Releases**](../../releases) page so you can try TinyOS Enhanced without setting up a cross-toolchain. Just QEMU.
