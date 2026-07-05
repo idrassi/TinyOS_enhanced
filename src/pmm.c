@@ -35,6 +35,30 @@
 #define PMM_CRITICAL_EXIT() \
     __asm__ volatile("pushl %0; popfl" : : "r"(__pmm_flags__) : "memory", "cc")
 
+/*
+ * PMM_CRITICAL_EXIT_RET(v) — restore interrupts and return `v`, keeping the
+ * value in a register (not a spillable stack slot) across the flags restore.
+ *
+ * Defense-in-depth only. The actual "pmm_alloc_contiguous returned 0x390018"
+ * corruption was NOT in this return path: the isr_common entry stub reloaded
+ * the kernel data selector (`mov ax,0x18`) BEFORE `pusha`, stamping 0x0018 over
+ * the low word of any interrupted EAX — including this function's in-flight
+ * return value — before it was saved (fixed in src/isr.S). Pinning the value in
+ * a register here does not prevent that (EAX is the ABI return register and is
+ * exposed with interrupts on across the whole return path regardless). We keep
+ * this macro because it is churn-neutral and keeps the return value off a stack
+ * slot across popfl, but it is not what fixed the panic.
+ */
+#define PMM_CRITICAL_EXIT_RET(v) \
+    do { \
+        register uint32_t __pmm_ret__ = (v); \
+        __asm__ volatile("pushl %1; popfl" \
+                         : "+r"(__pmm_ret__) \
+                         : "r"(__pmm_flags__) \
+                         : "memory", "cc"); \
+        return __pmm_ret__; \
+    } while (0)
+
 /*=============================================================================
  * PHYSICAL MEMORY CONFIGURATION
  *
@@ -51,6 +75,16 @@
  * Paging structures accessed via phys==virt must come from this range. */
 #define PMM_LOW_BYTES   (32u * 1024u * 1024u)
 #define PMM_LOW_FRAMES  (PMM_LOW_BYTES / PMM_PAGE_SIZE)
+
+/* Reserved low-memory floor (1 MiB). Frames below this hold the real-mode IVT,
+ * BIOS data area, VGA text buffer, EBDA and bootloader structures; they are
+ * marked used at boot (pmm_mark_used(0, 0x100000)) and must NEVER re-enter the
+ * allocatable pool. A pmm_free() of a frame here is always a bug: it silently
+ * un-reserves critical memory, and because the allocators are first-fit-from-0
+ * the frame is handed straight back — e.g. as a task kernel stack, which then
+ * trips the tss.esp0 "address in low memory" panic (the intermittent
+ * exec /hello.elf crash). We reject such frees loudly instead. */
+#define PMM_RESERVED_FLOOR  0x00100000u   /* 1 MiB — must match the boot low reservation */
 
 /*=============================================================================
  * BITMAP STORAGE
@@ -668,6 +702,16 @@ uint32_t pmm_alloc(void) {
          *-------------------------------------------------------------------*/
         if (!bget(i)) {
             /*-----------------------------------------------------------------
+             * Defense in depth: never hand out a reserved low-memory frame.
+             * Post-boot these frames are always marked used, so a free one
+             * here means the boot reservation was undone; skip it rather than
+             * return critical low memory as a general-purpose page.
+             *---------------------------------------------------------------*/
+            if (i * PMM_PAGE_SIZE < PMM_RESERVED_FLOOR) {
+                continue;
+            }
+
+            /*-----------------------------------------------------------------
              * Frame is free â€" allocate it
              *---------------------------------------------------------------*/
             bset(i);                        /* Mark frame as used */
@@ -675,12 +719,15 @@ uint32_t pmm_alloc(void) {
             if (frames_free)
                 frames_free--;              /* Decrement free count */
 
-            PMM_CRITICAL_EXIT();
-
             /*-----------------------------------------------------------------
-             * Convert frame index to physical address
+             * Convert frame index to physical address BEFORE releasing the
+             * critical section. If the multiply floats past PMM_CRITICAL_EXIT's
+             * popf, an IRQ/context-switch across the function tail can clobber
+             * the in-flight result register (same root cause as the exec-time
+             * tss.esp0 panic). Materialize into a volatile stack local under the
+             * lock, then return that. See pmm_alloc_contiguous for the detail.
              *---------------------------------------------------------------*/
-            return i * PMM_PAGE_SIZE;
+            PMM_CRITICAL_EXIT_RET(i * PMM_PAGE_SIZE);
         }
     }
 
@@ -721,7 +768,13 @@ uint32_t pmm_alloc_contiguous(uint32_t count) {
 
     PMM_CRITICAL_ENTER();
 
-    for (uint32_t base = 0; base + count <= PMM_MAX_FRAMES; ++base) {
+    /* Defense in depth: never begin a run inside the reserved low-memory
+     * region (< 1 MiB). Those frames are permanently reserved at boot; a run
+     * that started there could only arise from an erroneous low-frame free,
+     * and handing it back as e.g. a task kernel stack trips the tss.esp0
+     * low-memory panic. Skip straight to the first allocatable frame. */
+    uint32_t first = PMM_RESERVED_FLOOR / PMM_PAGE_SIZE;
+    for (uint32_t base = first; base + count <= PMM_MAX_FRAMES; ++base) {
         /* Check for `count` consecutive free frames starting at base. */
         uint32_t run = 0;
         while (run < count && !bget(base + run)) {
@@ -733,8 +786,16 @@ uint32_t pmm_alloc_contiguous(uint32_t count) {
                 bset(base + k);
                 if (frames_free) frames_free--;
             }
-            PMM_CRITICAL_EXIT();
-            return base * PMM_PAGE_SIZE;
+            /* Materialize the return value BEFORE re-enabling interrupts.
+             * The multiply must not float past PMM_CRITICAL_EXIT's popf: with
+             * interrupts on, an IRQ/context-switch across the tail (leave/ret)
+             * clobbered the in-flight result register, so pmm_alloc_contiguous
+             * returned a non-page-aligned/low address (e.g. 0x390018, 0x18000)
+             * that later tripped the tss.esp0 alignment/low-memory panic on the
+             * first exec after login. Compute into a volatile local under the
+             * lock and add a compiler barrier so the value is on the stack,
+             * fully formed, before the critical section ends. */
+            PMM_CRITICAL_EXIT_RET(base * PMM_PAGE_SIZE);
         }
         /* Skip past the used frame that broke the run (base+run). */
         base += run;
@@ -760,16 +821,21 @@ uint32_t pmm_alloc_contiguous(uint32_t count) {
 uint32_t pmm_alloc_low(void) {
     PMM_CRITICAL_ENTER();
 
-    for (uint32_t i = 0; i < PMM_LOW_FRAMES; ++i) {
+    /* Start above the reserved low-memory floor for the same reason as
+     * pmm_alloc/pmm_alloc_contiguous: never hand out a sub-1MiB frame, even if
+     * the boot reservation was somehow undone. The result of this allocator
+     * goes straight into CR3 (create_user_page_directory), so a low frame here
+     * would point CR3 into the IVT/BDA — a triple fault, the CR3-register twin
+     * of the tss.esp0 low-memory panic. */
+    for (uint32_t i = PMM_RESERVED_FLOOR / PMM_PAGE_SIZE; i < PMM_LOW_FRAMES; ++i) {
         if (!bget(i)) {
             bset(i);                        /* Mark frame as used */
 
             if (frames_free)
                 frames_free--;              /* Decrement free count */
 
-            PMM_CRITICAL_EXIT();
-
-            return i * PMM_PAGE_SIZE;
+            /* Materialize the result under the lock (see pmm_alloc). */
+            PMM_CRITICAL_EXIT_RET(i * PMM_PAGE_SIZE);
         }
     }
 
@@ -828,6 +894,27 @@ void pmm_free(uint32_t phys) {
      * Convert physical address to frame index
      *=======================================================================*/
     uint32_t i = phys / PMM_PAGE_SIZE;
+
+    /*=========================================================================
+     * SECURITY: Reject frees of the reserved low-memory region (< 1 MiB)
+     *
+     * Frames below PMM_RESERVED_FLOOR are marked used at boot and hold the
+     * IVT/BDA/VGA/EBDA/bootloader structures. A free here can only come from a
+     * bug (a stale or corrupted pointer, typically produced by a preemption
+     * race in the exec/teardown paths). Left silent, it un-reserves the frame,
+     * and first-fit allocation hands it back as the next task's kernel stack —
+     * producing the intermittent "Invalid TSS esp0: address in low memory"
+     * panic on exec /hello.elf. Reject it here so the corruption can never
+     * reach the bitmap, and log the caller's return address so the offending
+     * path is identifiable from the serial log.
+     *=======================================================================*/
+    if (phys < PMM_RESERVED_FLOOR) {
+        void* caller = __builtin_return_address(0);
+        kprintf("[PMM] REJECTED free of reserved low-mem frame 0x%08x "
+                "(frame %u, caller=0x%08x) — ignoring to protect low memory\n",
+                phys, i, (uint32_t)(uintptr_t)caller);
+        return;
+    }
 
     /*=========================================================================
      * CRITICAL SECTION: Protect bitmap and counter modifications

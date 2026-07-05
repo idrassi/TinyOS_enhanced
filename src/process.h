@@ -555,6 +555,7 @@ pid_handle_t task_get_handle(task_t* task);
  */
 task_t* task_current(void);
 bool task_is_valid_ptr(const void* p);  /* true if p points at a real tasks[] slot */
+bool task_slot_is_live(const task_t* task);  /* true if slot is live + current generation */
 
 /**
  * @brief Terminate a task

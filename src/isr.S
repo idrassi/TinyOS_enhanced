@@ -92,6 +92,16 @@ isr_common:
     push fs                     ; Save user FS
     push gs                     ; Save user GS
 
+    pusha                       ; Push all general-purpose registers (32 bytes)
+                                ; MUST precede the `mov ax,0x18` kernel-segment
+                                ; reload below: `mov ax,...` clobbers the low word
+                                ; of the interrupted EAX, and if that EAX still
+                                ; holds a live value (e.g. a function's in-flight
+                                ; return value across an interrupt-enabled window),
+                                ; the clobber is snapshotted by pusha and restored
+                                ; by iret -> silent low-word corruption of any
+                                ; preempted code. Snapshot EAX intact first.
+
     mov ax, 0x18                ; 0x18 = kernel data selector (GDT entry 3)
     mov ds, ax                  ; Load kernel DS
     mov es, ax                  ; Load kernel ES
@@ -102,7 +112,6 @@ isr_common:
                                 ; GCC assumes DF=0 for string operations
                                 ; Userland could have set DF=1 via STD instruction
 
-    pusha                       ; Push all general-purpose registers (32 bytes)
                                 ; ESP decremented by 32
                                 ; Stack layout after pusha:
                                 ; ESP+0:  EDI, ESI, EBP, ESP(old), EBX, EDX, ECX, EAX (32 bytes)

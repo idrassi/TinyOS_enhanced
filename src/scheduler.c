@@ -441,10 +441,23 @@ static task_t* scheduler_get_next_task(void) {
     // Round-robin: return head and advance to next
     task_t* next = (task_t*)ready_queue_head;  /* Cast volatile to non-volatile for local use */
 
-    // Terminated tasks should already be removed from ready queue by sys_exit()
-    // If we find one here, it's a bug - log warning but handle gracefully
-    if (next->state == TASK_STATE_TERMINATED) {
-        kprintf("[SCHEDULER] WARNING: Found terminated task PID=%d in ready queue!\n", next->pid);
+    // Defense in depth: only switch to a task that is positively runnable AND a
+    // live current-incarnation slot. Terminated tasks should already have been
+    // removed by sys_exit(); a freed-and-recycled slot (bumped generation) or a
+    // dead/blocked entry lingering in the ready queue must NOT be switched to —
+    // scheduler_switch_kernel_context would otherwise feed its stale/torn-down
+    // kernel_stack straight into tss_set_kernel_stack (esp0 panic). Reject and
+    // retry rather than trusting a bare != TERMINATED check.
+    //
+    // Runnable = READY, or RUNNING (the single-task round-robin case re-selects
+    // the current task, which is left in RUNNING state until preemption). Any
+    // other state (BLOCKED, SLEEPING, ZOMBIE, TERMINATED) or a stale/freed slot
+    // is rejected.
+    bool runnable = (next->state == TASK_STATE_READY ||
+                     next->state == TASK_STATE_RUNNING);
+    if (!runnable || !task_slot_is_live(next)) {
+        kprintf("[SCHEDULER] WARNING: Rejecting non-runnable/stale ready-queue "
+                "entry PID=%d state=%d\n", next->pid, next->state);
         scheduler_remove_task(next);
         return scheduler_get_next_task();  // Try again
     }

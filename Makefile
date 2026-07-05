@@ -171,6 +171,13 @@ src/shell.o: src/shell.c src/kernel.h
 # Link kernel ELF via gcc driver so libgcc is available if needed
 kernel.elf: $(OBJ)
 	$(LD) $(LDFLAGS) -o $@ $(OBJ) -lgcc
+	@# Regression guard: the isr_common interrupt entry stub MUST execute pusha
+	@# BEFORE reloading the kernel data selector (mov $0x18,%ax). If the segment
+	@# reload runs first it stamps 0x0018 over the low word of the interrupted
+	@# EAX before pusha saves it, silently corrupting the low word of any code
+	@# preempted with a live value in EAX (was the tss.esp0=0x..018 panic).
+	@$(CROSS)objdump -d $@ | awk '/<isr_common>:/{f=1} f&&/pusha/{print "pusha";exit} f&&/mov +\$$0x18,%ax/{print "movax";exit}' | grep -qx pusha \
+		|| { echo "BUILD GUARD FAILED: isr_common reloads %ax before pusha (EAX-clobber regression) — see src/isr.S"; exit 1; }
 
 # Pull in auto-generated header dependencies (-MMD). Safe if absent.
 -include $(OBJ:.o=.d)

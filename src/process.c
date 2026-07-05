@@ -1274,6 +1274,28 @@ bool task_is_valid_ptr(const void* p) {
 }
 
 /*=============================================================================
+ * FUNCTION: task_slot_is_live
+ * PURPOSE: True iff `p` points at a live, current-incarnation task slot.
+ *
+ * Stronger than task_is_valid_ptr: also requires a non-free pid and a
+ * generation that still matches the slot. A freed-and-recycled slot bumps
+ * slot_generations[slot], so a STALE pointer left dangling in the ready queue
+ * (freed slot, or an incarnation that has since been reused) fails the
+ * generation compare. The scheduler uses this to refuse switching to a stale
+ * ready-queue entry — the read-side complement to deferring the kernel-stack
+ * free in task_terminate (a stale entry could otherwise feed a torn-down
+ * kernel_stack straight into tss_set_kernel_stack → esp0 panic).
+ *=============================================================================*/
+bool task_slot_is_live(const task_t* task) {
+    if (!task_is_valid_ptr(task)) return false;
+    if (task->pid == 0) return false;  /* freed slots zero pid */
+    uintptr_t base = (uintptr_t)&tasks[0];
+    uint32_t slot = (uint32_t)(((uintptr_t)task - base) / sizeof(task_t));
+    if (slot >= MAX_TASKS) return false;
+    return task->generation == slot_generations[slot];
+}
+
+/*=============================================================================
  * FUNCTION: task_set_current
  * PURPOSE: Set currently running task (used by scheduler)
  *=============================================================================*/
@@ -1363,23 +1385,35 @@ void task_terminate(uint32_t pid) {
 
         kprintf("[PROCESS] Terminating task PID=%d '%s'\n", task->pid, task->name);
 
-        task_free_resources(task);
-
         // Clean up streams (close any open file descriptors)
         streams_cleanup(&task->streams);
 
-        // Mark task as terminated and clear PID to indicate slot is available
-        task->state = TASK_STATE_TERMINATED;
-        task->pid = 0;  // Mark slot as free
-
         // A task terminated while not running never reaches the scheduler
-        // cleanup queue (it is reaped off the ready queue without freeing
-        // its slot), so release the slot here. A self-terminating task is
-        // still on its kernel stack; its slot is freed by the scheduler
-        // cleanup path after the final context switch.
+        // cleanup queue (it is reaped off the ready queue without freeing its
+        // slot), so free its resources and release its slot here. A
+        // self-terminating task, by contrast, is STILL EXECUTING ON ITS KERNEL
+        // STACK: freeing its resources now would pmm_free the 8 kernel-stack
+        // frames it is running on, returning them to the allocator so the next
+        // exec's pmm_alloc_contiguous(8) can reclaim them while the dying task
+        // still pushes/writes to them — a live use-after-free and free-then-
+        // realloc that corrupts the next task's kernel stack (intermittent
+        // first-exec-after-login corruption). So for self-exit, defer BOTH the
+        // resource-free and the slot-free to the scheduler cleanup path
+        // (scheduler.c), which runs task_free_resources + task_free_slot_for_task
+        // AFTER the final context switch has moved esp onto the reaper's stack.
+        // task_free_resources is idempotent, so the deferred call is the sole
+        // freer for self-exiting tasks with no double-free.
         if (task != scheduler_get_current_task()) {
+            task_free_resources(task);
+            task->state = TASK_STATE_TERMINATED;
+            task->pid = 0;  // Mark slot as free
             scheduler_remove_task(task);
             task_free_slot_for_task(task);
+        } else {
+            // Self-exit: mark terminated so the scheduler queues us for cleanup,
+            // but leave resources/slot for the deferred post-switch reaper.
+            task->state = TASK_STATE_TERMINATED;
+            task->pid = 0;
         }
     }
 }
