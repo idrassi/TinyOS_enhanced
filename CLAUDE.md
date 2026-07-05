@@ -31,6 +31,49 @@ and `elf_load_process`'s `allocated_frames[4096]` were made `static`. ECDSA P-25
 bit-serial and slow under QEMU/TCG, but that is a speed cost, **not** a correctness or
 fault issue — the verify completes and passes.
 
+## FIXED: intermittent `Invalid TSS esp0` panic on `exec` (isr.S EAX clobber)
+
+Separate from the stack-overflow triple-faults above. `exec /hello.elf` intermittently
+(~1/9 boots) panicked with `Invalid TSS esp0: misaligned pointer` — the user task's
+kernel stack came out as e.g. `0x00398018` (base `0x390018`, low `0x18` bits set),
+which `tss_set_kernel_stack` rejects. Root-caused and fixed 2026-07-05 (branch
+`fix/isr-eax-clobber-tss-panic`, commit `f4e1e52`; **not pushed**).
+
+**Root cause — `src/isr.S` `isr_common` reloaded the kernel data selector
+(`mov ax,0x18`) BEFORE `pusha`.** Any interrupt taken while a live value sat in EAX had
+its low 16 bits stamped with `0x0018` before the register was saved; `pusha` then
+snapshotted the corrupted EAX and `iret` restored it. `pmm_alloc_contiguous` returns
+`base<<12` (e.g. `0x390000`) in **EAX — the ABI return register** — live across the
+interrupt-enabled return path; a timer IRQ in that window turned it into `0x390018`,
+an unaligned kernel-stack base → `tss.esp0` panic. The `0x18` is **deterministic** (the
+constant selector, not a timing tear); only *whether* the IRQ lands in the window is
+timing-dependent (hence intermittent). This silently corrupts the low word of EAX for
+**any** code preempted with a live value there — general, not allocator-specific.
+
+**Fix:** move `pusha` before the `mov ax,0x18` segment-reload block so EAX is snapshotted
+intact. Stack layout is unchanged (`push ds/es/fs/gs` then `pusha`; epilogue untouched),
+so `interrupt_regs_t` and the return path are unaffected. `syscall.S` was already safe
+(it `push eax`es before the selector reload). A **Makefile post-link objdump guard**
+now fails the build if `isr_common` ever regresses to reloading `%ax` before `pusha`.
+
+**Two OS bugs found while auditing for the same class, also fixed in the commit:**
+(1) the #PF stack-overflow self-kill (`idt.c:247 task_terminate(current)`) freed the 8
+kernel-stack frames the fault handler was still running on — now defers self-exit
+resource/slot free to the post-switch reaper when `task == current` (the clean-exit
+`sys_exit` ZOMBIE path was already safe); (2) `scheduler_get_next_task` only rejected
+TERMINATED entries — now gates on `task_slot_is_live()` (valid ptr + pid + current
+generation, accept only READY/RUNNING) so a stale/freed/recycled ready-queue entry's
+`kernel_stack` never reaches `tss_set_kernel_stack`.
+
+**WRONG theory, for the record:** this was first mis-diagnosed as a compiler floating
+`pmm_alloc_contiguous`'s `base<<12` past an inline `popf` (a preemption tear of the
+return value), "fixed" with a register-pin macro (`PMM_CRITICAL_EXIT_RET`). The panic
+recurred with the **identical** `0x390018` and the pin objdump-verified present — a
+deterministic value cannot be a timing tear, which is what pointed to the ISR. The pin
+is kept as churn-neutral defense-in-depth with a corrected comment, but it is **not**
+what fixed the panic. **Verified: 53/53 clean boots** (30+15+8), zero panics, zero
+misaligned bases, vs the prior ~1/9 failure rate.
+
 ## Security work
 
 All security history is layered; the index is `doc/SECURITY_STATUS_COMPLETE.md`. The

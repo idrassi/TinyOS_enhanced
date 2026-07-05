@@ -218,7 +218,6 @@ static pae_pte_t* alloc_initial_pt(void) {
     if (pt_phys == 0) {
         return NULL;  /* Out of physical memory */
     }
-
     /*=========================================================================
      * CRITICAL FIX: Ensure PMM-allocated page table is identity-mapped
      *
