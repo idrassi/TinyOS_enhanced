@@ -57,9 +57,10 @@ git add -f web/tinyos.iso
 ```
 
 The committed ISO carries the same content as the signed `v2.0` release asset
-(SHA-256 `91e6968d93e7887c90b5653f76c0fb4f9ccf674127b2b4df0b38ca187358e834` as of
-2026-07-05). Note `i686-elf-grub-mkrescue` is non-deterministic, so a fresh
-rebuild will hash differently even with identical inputs.
+(SHA-256 `b78c4ddc398ae1a78e924bf8abe98b17005c923ff77407b5b1cc91052115f7c6` as of
+2026-07-07 — includes the W^X NX-coverage fix from PR #17). Note
+`i686-elf-grub-mkrescue` is non-deterministic, so a fresh rebuild will hash
+differently even with identical inputs.
 
 ## Refreshing the deployed site
 
