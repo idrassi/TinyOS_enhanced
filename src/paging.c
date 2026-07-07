@@ -290,11 +290,14 @@ uint32_t map_mmio(uint32_t phys_addr, uint32_t size) {
      * 2. Reconfigure NIC settings (promiscuous mode, MAC spoofing)
      * 3. Crash the system by writing invalid register values
      *
-     * MMIO flags: Present, Read/Write, Cache Disable, Write-Through
+     * MMIO flags: Present, Read/Write, Cache Disable, Write-Through, NX
      * - Cache Disable is required for hardware correctness (no stale register reads)
      * - Write-Through ensures immediate register writes
+     * - NX: device registers are never legitimately executable; without it
+     *   these pages show up as R+W+X in pae_wx_audit() (PAE_FLAGS_MASK in
+     *   map_page() passes the NX bit through when PAE is active)
      *=======================================================================*/
-    uint32_t flags = PAGE_PRESENT | PAGE_READWRITE | PAGE_CACHE_DISABLE | PAGE_WRITETHROUGH; 
+    uint64_t flags = PAGE_PRESENT | PAGE_READWRITE | PAGE_CACHE_DISABLE | PAGE_WRITETHROUGH | PAE_NX;
 
     // kprintf("Paging: Mapping MMIO region 0x%x (Phys) to 0x%x (Virt, size 0x%x)...\n",
     //         phys_addr, start_addr, size);
@@ -985,7 +988,7 @@ void ensure_physical_range_mapped(uint32_t phys_start, uint32_t size) {
         uint32_t* pte = get_page_table_entry(phys);
         if (!pte || !(*pte & PAGE_PRESENT)) {
             kprintf("  Mapping phys 0x%08x for kernel access\n", phys);
-            map_page(phys, phys, PAGE_PRESENT | PAGE_READWRITE);
+            map_page(phys, phys, PAGE_PRESENT | PAGE_READWRITE | PAE_NX);
         }
     }
 }
