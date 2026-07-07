@@ -529,10 +529,10 @@ int task_create_kernel(void (*entry)(void), const char* name) {
     // CRITICAL FIX: Map guard page and stack pages into page tables
     // The guard page is mapped but marked NOT PRESENT (handled below)
     // Stack pages need to be identity-mapped (virtual == physical) so they can be accessed
-    map_page(guard_page_phys, guard_page_phys, PAGE_READWRITE);  // Will be marked NOT PRESENT below
+    map_page(guard_page_phys, guard_page_phys, PAGE_READWRITE | PAE_NX);  // Will be marked NOT PRESENT below
     for (int i = 0; i < KERNEL_TASK_STACK_PAGES; i++) {
         // Identity-map each stack page (virtual address = physical address)
-        map_page(stack_pages[i], stack_pages[i], PAGE_PRESENT | PAGE_READWRITE);
+        map_page(stack_pages[i], stack_pages[i], PAGE_PRESENT | PAGE_READWRITE | PAE_NX);
         // CRITICAL: Flush TLB after mapping so page is immediately accessible
         flush_tlb_single(stack_pages[i]);
     }
@@ -831,7 +831,7 @@ int task_create_user_ex(uint32_t entry, const char* name, uint16_t stack_pages) 
 
     // Map kernel stack pages (identity mapping) and flush TLB
     for (int i = 0; i < 8; i++) {
-        map_page(kernel_stack_pages[i], kernel_stack_pages[i], PAGE_PRESENT | PAGE_READWRITE);
+        map_page(kernel_stack_pages[i], kernel_stack_pages[i], PAGE_PRESENT | PAGE_READWRITE | PAE_NX);
         flush_tlb_single(kernel_stack_pages[i]);
     }
 

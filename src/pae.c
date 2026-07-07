@@ -249,7 +249,7 @@ static pae_pte_t* alloc_initial_pt(void) {
         return NULL;
     }
     alloc_pt_recursion_depth++;
-    pae_map_page(pt_phys, (uint64_t)pt_phys, PAE_PRESENT | PAE_READWRITE);
+    pae_map_page(pt_phys, (uint64_t)pt_phys, PAE_PRESENT | PAE_READWRITE | PAE_NX);
     alloc_pt_recursion_depth--;
 
     /* Zero the newly allocated page table */
@@ -551,6 +551,27 @@ void pae_init(void) {
     /* Step 5: Enable NX bit */
     if (pae_enable_nx()) {
         kprintf("[PAE] NX bit support............... [OK]\n");
+
+        /*=====================================================================
+         * SECURITY FIX: NX the general RAM identity map
+         *
+         * The loop above (step 4) mapped ALL of RAM as PAE_PRESENT |
+         * PAE_READWRITE with no NX, because NX isn't enabled yet at that
+         * point and the loop must remain correct regardless of NX support.
+         * Left as-is, every non-kernel-section page in physical RAM (heap,
+         * PMM pool, RAMFS-allocated frames) stays permanently R+W+X, which
+         * is what pae_wx_audit()/`secstatus`/`wxaudit` correctly flag.
+         *
+         * Now that NX is available, re-mark the whole identity map NX
+         * (R+W+NX, i.e. PAE_PAGE_KERNEL_DATA) so ordinary RAM can still be
+         * allocated and written by PMM/RAMFS but can no longer be executed.
+         * pae_apply_kernel_wx() (next step) then re-opens exactly the
+         * kernel .text/.user.text ranges as R+X on top of this.
+         *=====================================================================*/
+        kprintf("[PAE] Applying NX to general RAM identity map...\n");
+        for (uint32_t phys = 0; phys < total_bytes; phys += 4096) {
+            pae_map_page(phys, phys, PAE_PAGE_KERNEL_DATA);
+        }
     } else {
         kprintf("[PAE] NX bit support............... [UNAVAILABLE]\n");
         kprintf("[PAE] W^X enforcement limited\n");
