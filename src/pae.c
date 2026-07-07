@@ -750,6 +750,12 @@ uint32_t pae_wx_audit(void) {
     uint32_t writable_pages = 0;
     uint32_t wx_violations = 0;
 
+    /* Cap verbose per-violation lines: without NX support (e.g. v86, which has
+     * no NX bit at all) nearly every writable page qualifies, and printing one
+     * line each floods/hangs a slow console. Detailed lines still help pinpoint
+     * the handful of real violations on NX-capable hardware/QEMU. */
+    #define PAE_WX_AUDIT_PRINT_LIMIT 20
+
     /* Scan all page tables */
     for (int pdpt_idx = 0; pdpt_idx < PAE_PDPT_ENTRIES; pdpt_idx++) {
         if (!(pdpt[pdpt_idx] & PAE_PRESENT)) continue;
@@ -779,12 +785,17 @@ uint32_t pae_wx_audit(void) {
                 if (writable && executable) {
                     wx_violations++;
 
-                    /* Calculate virtual address */
-                    uint32_t virt = (pdpt_idx << 30) | (pd_idx << 21) | (pt_idx << 12);
-                    uint64_t phys = pte & PAE_FRAME_MASK;
+                    if (wx_violations <= PAE_WX_AUDIT_PRINT_LIMIT) {
+                        /* Calculate virtual address */
+                        uint32_t virt = (pdpt_idx << 30) | (pd_idx << 21) | (pt_idx << 12);
+                        uint64_t phys = pte & PAE_FRAME_MASK;
 
-                    kprintf("[W^X] VIOLATION: virt=0x%08x phys=0x%012llx (R+W+X)\n",
-                            virt, phys);
+                        kprintf("[W^X] VIOLATION: virt=0x%08x phys=0x%012llx (R+W+X)\n",
+                                virt, phys);
+                    } else if (wx_violations == PAE_WX_AUDIT_PRINT_LIMIT + 1) {
+                        kprintf("[W^X] ... further violations suppressed (NX likely "
+                                "unsupported by this CPU/emulator) - see summary below\n");
+                    }
                 }
             }
         }
