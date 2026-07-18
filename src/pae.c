@@ -676,6 +676,101 @@ pae_pte_t* pae_get_pte(uint32_t virt) {
     return pae_get_pte_in(pae_default_pdpt_phys(), virt);
 }
 
+static bool pae_user_range_bounds(uint32_t start, size_t len,
+                                  uint32_t* last_out) {
+    if (len == 0) {
+        return true;
+    }
+
+    /* Keep the null page unavailable and USER_SPACE_END as an exclusive bound. */
+    if (start < PAGE_SIZE || start >= USER_SPACE_END) {
+        return false;
+    }
+
+    uint64_t last_wide = (uint64_t)start + (uint64_t)len - 1u;
+    if (last_wide >= USER_SPACE_END) {
+        return false;
+    }
+
+    *last_out = (uint32_t)last_wide;
+    return true;
+}
+
+/* Caller holds the paging critical section for the complete walk. */
+static bool pae_user_range_accessible_locked(uint32_t pdpt_phys,
+                                             uint32_t start, uint32_t last,
+                                             bool require_write) {
+    pae_pdpte_t* target_pdpt = pae_pdpt_from_phys(pdpt_phys);
+    uint64_t required = PAE_PRESENT | PAE_USER;
+    if (require_write) {
+        required |= PAE_READWRITE;
+    }
+
+    uint32_t page = start & ~(PAGE_SIZE - 1u);
+    uint32_t final_page = last & ~(PAGE_SIZE - 1u);
+
+    for (;;) {
+        uint32_t pdpt_idx = PAE_PDPT_INDEX(page);
+        uint32_t pd_idx = PAE_PD_INDEX(page);
+        uint32_t pt_idx = PAE_PT_INDEX(page);
+
+        pae_pdpte_t pdpte = target_pdpt[pdpt_idx];
+        if (!(pdpte & PAE_PRESENT)) {
+            return false;
+        }
+
+        pae_pde_t* pd = (pae_pde_t*)(uintptr_t)(pdpte & PAE_FRAME_MASK);
+        pae_pde_t pde = pd[pd_idx];
+        if ((pde & required) != required) {
+            return false;
+        }
+
+        if (!(pde & PAE_LARGE_PAGE)) {
+            pae_pte_t* pt = (pae_pte_t*)(uintptr_t)(pde & PAE_FRAME_MASK);
+            pae_pte_t pte = pt[pt_idx];
+            if ((pte & required) != required) {
+                return false;
+            }
+        }
+
+        if (page == final_page) {
+            return true;
+        }
+        page += PAGE_SIZE;
+    }
+}
+
+bool pae_user_range_accessible_in(uint32_t pdpt_phys, uint32_t start,
+                                  size_t len, bool require_write) {
+    uint32_t last = 0;
+    if (!pae_active || !pae_user_range_bounds(start, len, &last)) {
+        return len == 0 && pae_active;
+    }
+
+    CRITICAL_SECTION_ENTER();
+    bool allowed = pae_user_range_accessible_locked(pdpt_phys, start, last,
+                                                    require_write);
+    CRITICAL_SECTION_EXIT();
+    return allowed;
+}
+
+bool pae_user_range_accessible(uint32_t start, size_t len,
+                               bool require_write) {
+    uint32_t last = 0;
+    if (!pae_active || !pae_user_range_bounds(start, len, &last)) {
+        return len == 0 && pae_active;
+    }
+
+    /* Read CR3 with interrupts disabled so the selected address space cannot
+     * change before the walk completes on this single-core kernel. */
+    CRITICAL_SECTION_ENTER();
+    uint32_t pdpt_phys = pae_read_cr3_pdpt();
+    bool allowed = pae_user_range_accessible_locked(pdpt_phys, start, last,
+                                                    require_write);
+    CRITICAL_SECTION_EXIT();
+    return allowed;
+}
+
 void pae_map_page(uint32_t virt, uint64_t phys, uint64_t flags) {
     pae_map_page_into(kernel_pdpt_phys, virt, phys, flags);
 }
