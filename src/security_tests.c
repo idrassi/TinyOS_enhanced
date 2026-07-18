@@ -18,6 +18,7 @@
 #include "errno.h"
 #include "memory.h"
 #include "kernel.h"
+#include "net.h"
 #include "kprintf.h"
 #include "util.h"
 #include <stdint.h>
@@ -463,6 +464,22 @@ cleanup:
 }
 
 /*=============================================================================
+ * TEST 9: ARP Cache Poisoning Protection
+ *=============================================================================*/
+static void test_arp_cache_poisoning(void) {
+    kprintf("\n");
+    kprintf("=====================================================\n");
+    kprintf("TEST 9: ARP Cache Poisoning Protection\n");
+    kprintf("=====================================================\n");
+
+    bool passed = arp_security_self_test();
+
+    kprintf("-----------------------------------------------------\n");
+    kprintf("TEST 9: %s\n", passed ? "PASSED" : "FAILED");
+    kprintf("=====================================================\n");
+}
+
+/*=============================================================================
  * Main Test Runner
  *=============================================================================*/
 void run_security_tests(void) {
@@ -490,6 +507,7 @@ void run_security_tests(void) {
     test_stack_canary();
     test_hardened_usercopy();
     test_user_exception_containment();
+    test_arp_cache_poisoning();
 
     kprintf("\n");
     kprintf("*************************************************************\n");

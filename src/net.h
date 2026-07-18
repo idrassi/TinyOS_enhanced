@@ -217,6 +217,7 @@ void send_arp_request(uint8_t* target_ip);
 uint8_t* arp_lookup(const uint8_t* ip);
 void arp_cache_dump(void);
 void arp_cache_update(const uint8_t* ip, const uint8_t* mac);
+bool arp_security_self_test(void);
 void send_test_arp(const char *target_ip_str);
 
 // Protocol Senders

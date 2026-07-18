@@ -79,6 +79,14 @@ typedef struct {
 static arp_pending_request_t arp_pending_requests[ARP_MAX_PENDING_REQUESTS];
 static uint32_t arp_requests_dropped = 0;  // Counter for dropped requests (monitoring)
 
+static bool arp_pending_request_matches(const uint8_t* ip);
+static void arp_pending_request_clear(const uint8_t* ip);
+static int arp_cache_find_index(const uint8_t* ip);
+static bool arp_cache_contains_ip(const uint8_t* ip);
+static bool is_invalid_arp_sender_ip(const uint8_t* ip);
+static bool is_valid_arp_ip(const uint8_t* ip);
+static bool is_valid_arp_sender_mac(const uint8_t* mac);
+
 /*=============================================================================
  * FUNCTION: arp_cache_evict_expired
  * PURPOSE: Evict expired ARP cache entries (DoS protection)
@@ -98,6 +106,53 @@ static void arp_cache_evict_expired(void) {
             }
         }
     }
+}
+
+static bool arp_pending_request_matches(const uint8_t* ip) {
+    uint32_t current_ticks = get_timer_ticks();
+
+    for (int i = 0; i < ARP_MAX_PENDING_REQUESTS; i++) {
+        if (!arp_pending_requests[i].pending) {
+            continue;
+        }
+
+        uint32_t age = current_ticks - arp_pending_requests[i].last_request_time;
+        if (age > ARP_PENDING_TIMEOUT_TICKS) {
+            arp_pending_requests[i].pending = false;
+            memset(arp_pending_requests[i].ip, 0, 4);
+            continue;
+        }
+
+        if (memcmp(arp_pending_requests[i].ip, ip, 4) == 0) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static void arp_pending_request_clear(const uint8_t* ip) {
+    for (int i = 0; i < ARP_MAX_PENDING_REQUESTS; i++) {
+        if (arp_pending_requests[i].pending &&
+            memcmp(arp_pending_requests[i].ip, ip, 4) == 0) {
+            arp_pending_requests[i].pending = false;
+            memset(arp_pending_requests[i].ip, 0, 4);
+        }
+    }
+}
+
+static int arp_cache_find_index(const uint8_t* ip) {
+    for (int i = 0; i < ARP_CACHE_SIZE; i++) {
+        if (arp_cache[i].valid && memcmp(arp_cache[i].ip, ip, 4) == 0) {
+            return i;
+        }
+    }
+
+    return -1;
+}
+
+static bool arp_cache_contains_ip(const uint8_t* ip) {
+    return arp_cache_find_index(ip) >= 0;
 }
 
 
@@ -320,16 +375,48 @@ uint8_t* arp_lookup(const uint8_t* ip) {
  * SECURITY: Implements LRU eviction to prevent cache exhaustion attacks
  */
 void arp_cache_update(const uint8_t* ip, const uint8_t* mac) {
+    if (!ip || !mac) {
+        return;
+    }
+
+    if (is_invalid_arp_sender_ip(ip) ||
+        !is_valid_arp_ip(ip) ||
+        !is_valid_arp_sender_mac(mac)) {
+        return;
+    }
+
+    if (memcmp(ip, my_ip, 4) == 0) {
+        return;
+    }
+
     uint32_t current_ticks = get_timer_ticks();
+    bool has_pending_request = arp_pending_request_matches(ip);
+    bool is_gateway = (memcmp(ip, gateway_ip, 4) == 0);
 
     // Check if entry exists and update it
-    for (int i = 0; i < ARP_CACHE_SIZE; i++) {
-        if (arp_cache[i].valid && memcmp(arp_cache[i].ip, ip, 4) == 0) {
-            memcpy(arp_cache[i].mac, mac, 6);
-            arp_cache[i].last_used = current_ticks;
-            // kprintf("ARP: Cache updated for IP %d.%d.%d.%d\n", ip[0], ip[1], ip[2], ip[3]);
-            return;
+    int existing_index = arp_cache_find_index(ip);
+    if (existing_index >= 0) {
+        arp_cache_entry_t* entry = &arp_cache[existing_index];
+
+        if (memcmp(entry->mac, mac, 6) != 0) {
+            if (!has_pending_request) {
+                return;
+            }
+
+            memcpy(entry->mac, mac, 6);
         }
+
+        entry->last_used = current_ticks;
+        arp_pending_request_clear(ip);
+        return;
+    }
+
+    /*
+     * Gateway poisoning changes the route for off-subnet traffic. Only learn a
+     * new gateway mapping after TinyOS sent an ARP request for that gateway.
+     */
+    if (is_gateway && !has_pending_request) {
+        return;
     }
 
     // Find first invalid slot
@@ -339,9 +426,14 @@ void arp_cache_update(const uint8_t* ip, const uint8_t* mac) {
             memcpy(arp_cache[i].mac, mac, 6);
             arp_cache[i].last_used = current_ticks;
             arp_cache[i].valid = true;
+            arp_pending_request_clear(ip);
             // kprintf("ARP: Added new cache entry for IP %d.%d.%d.%d\n", ip[0], ip[1], ip[2], ip[3]);
             return;
         }
+    }
+
+    if (!has_pending_request) {
+        return;
     }
 
     // Cache is full - evict LRU (Least Recently Used) entry
@@ -365,8 +457,120 @@ void arp_cache_update(const uint8_t* ip, const uint8_t* mac) {
     memcpy(arp_cache[lru_index].mac, mac, 6);
     arp_cache[lru_index].last_used = current_ticks;
     arp_cache[lru_index].valid = true;
+    arp_pending_request_clear(ip);
 
     // kprintf("ARP: Added new cache entry for IP %d.%d.%d.%d (via LRU)\n", ip[0], ip[1], ip[2], ip[3]);
+}
+
+bool arp_security_self_test(void) {
+    arp_cache_entry_t saved_cache[ARP_CACHE_SIZE];
+    arp_pending_request_t saved_pending[ARP_MAX_PENDING_REQUESTS];
+    uint8_t saved_my_ip[4];
+    uint8_t saved_my_mac[6];
+    uint8_t saved_subnet_mask[4];
+    uint8_t saved_gateway_ip[4];
+    uint32_t saved_requests_dropped = arp_requests_dropped;
+    bool passed = true;
+
+    memcpy(saved_cache, arp_cache, sizeof(saved_cache));
+    memcpy(saved_pending, arp_pending_requests, sizeof(saved_pending));
+    memcpy(saved_my_ip, my_ip, sizeof(saved_my_ip));
+    memcpy(saved_my_mac, my_mac, sizeof(saved_my_mac));
+    memcpy(saved_subnet_mask, subnet_mask, sizeof(saved_subnet_mask));
+    memcpy(saved_gateway_ip, gateway_ip, sizeof(saved_gateway_ip));
+
+    memset(arp_cache, 0, sizeof(arp_cache));
+    memset(arp_pending_requests, 0, sizeof(arp_pending_requests));
+    arp_requests_dropped = 0;
+
+    const uint8_t test_my_ip[4] = {10, 7, 0, 10};
+    const uint8_t test_my_mac[6] = {0x52, 0x54, 0x00, 0x7A, 0x00, 0x10};
+    const uint8_t test_mask[4] = {255, 255, 255, 0};
+    const uint8_t test_gateway[4] = {10, 7, 0, 1};
+    const uint8_t gateway_mac[6] = {0x52, 0x54, 0x00, 0x7A, 0x00, 0x01};
+    const uint8_t attacker_mac[6] = {0x52, 0x54, 0x00, 0x7A, 0x0F, 0x0F};
+    const uint8_t local_ip[4] = {10, 7, 0, 25};
+    const uint8_t local_mac[6] = {0x52, 0x54, 0x00, 0x7A, 0x00, 0x25};
+    const uint8_t moved_local_mac[6] = {0x52, 0x54, 0x00, 0x7A, 0x00, 0x26};
+    const uint8_t multicast_mac[6] = {0x01, 0x00, 0x5E, 0x00, 0x00, 0x01};
+    const uint8_t off_subnet_ip[4] = {10, 8, 0, 40};
+
+    memcpy(my_ip, test_my_ip, sizeof(my_ip));
+    memcpy(my_mac, test_my_mac, sizeof(my_mac));
+    memcpy(subnet_mask, test_mask, sizeof(subnet_mask));
+    memcpy(gateway_ip, test_gateway, sizeof(gateway_ip));
+
+    memcpy(arp_pending_requests[0].ip, test_gateway, 4);
+    arp_pending_requests[0].last_request_time = get_timer_ticks();
+    arp_pending_requests[0].pending = true;
+    arp_cache_update(test_gateway, gateway_mac);
+    int gateway_index = arp_cache_find_index(test_gateway);
+    bool gateway_learned = (gateway_index >= 0 &&
+                            memcmp(arp_cache[gateway_index].mac, gateway_mac, 6) == 0 &&
+                            !arp_pending_request_matches(test_gateway));
+    kprintf("[ARP] Pending gateway reply learned: %s\n",
+            gateway_learned ? "PASSED" : "FAILED");
+    passed = passed && gateway_learned;
+
+    arp_cache_update(test_gateway, attacker_mac);
+    gateway_index = arp_cache_find_index(test_gateway);
+    bool gateway_poison_rejected = (gateway_index >= 0 &&
+                                    memcmp(arp_cache[gateway_index].mac, gateway_mac, 6) == 0);
+    kprintf("[ARP] Unsolicited gateway change rejected: %s\n",
+            gateway_poison_rejected ? "PASSED" : "FAILED");
+    passed = passed && gateway_poison_rejected;
+
+    arp_cache_update(local_ip, local_mac);
+    int local_index = arp_cache_find_index(local_ip);
+    bool local_learned = (local_index >= 0 &&
+                          memcmp(arp_cache[local_index].mac, local_mac, 6) == 0);
+    kprintf("[ARP] Passive local peer learned: %s\n",
+            local_learned ? "PASSED" : "FAILED");
+    passed = passed && local_learned;
+
+    arp_cache_update(local_ip, attacker_mac);
+    local_index = arp_cache_find_index(local_ip);
+    bool local_poison_rejected = (local_index >= 0 &&
+                                  memcmp(arp_cache[local_index].mac, local_mac, 6) == 0);
+    kprintf("[ARP] Unsolicited local change rejected: %s\n",
+            local_poison_rejected ? "PASSED" : "FAILED");
+    passed = passed && local_poison_rejected;
+
+    memcpy(arp_pending_requests[1].ip, local_ip, 4);
+    arp_pending_requests[1].last_request_time = get_timer_ticks();
+    arp_pending_requests[1].pending = true;
+    arp_cache_update(local_ip, moved_local_mac);
+    local_index = arp_cache_find_index(local_ip);
+    bool pending_local_change_allowed = (local_index >= 0 &&
+                                         memcmp(arp_cache[local_index].mac, moved_local_mac, 6) == 0 &&
+                                         !arp_pending_request_matches(local_ip));
+    kprintf("[ARP] Pending local change allowed: %s\n",
+            pending_local_change_allowed ? "PASSED" : "FAILED");
+    passed = passed && pending_local_change_allowed;
+
+    arp_cache_update(off_subnet_ip, local_mac);
+    bool off_subnet_rejected = (arp_cache_find_index(off_subnet_ip) < 0);
+    kprintf("[ARP] Off-subnet sender rejected: %s\n",
+            off_subnet_rejected ? "PASSED" : "FAILED");
+    passed = passed && off_subnet_rejected;
+
+    arp_cache_update(local_ip, multicast_mac);
+    local_index = arp_cache_find_index(local_ip);
+    bool invalid_mac_rejected = (local_index >= 0 &&
+                                 memcmp(arp_cache[local_index].mac, moved_local_mac, 6) == 0);
+    kprintf("[ARP] Invalid sender MAC rejected: %s\n",
+            invalid_mac_rejected ? "PASSED" : "FAILED");
+    passed = passed && invalid_mac_rejected;
+
+    memcpy(arp_cache, saved_cache, sizeof(arp_cache));
+    memcpy(arp_pending_requests, saved_pending, sizeof(arp_pending_requests));
+    memcpy(my_ip, saved_my_ip, sizeof(my_ip));
+    memcpy(my_mac, saved_my_mac, sizeof(my_mac));
+    memcpy(subnet_mask, saved_subnet_mask, sizeof(subnet_mask));
+    memcpy(gateway_ip, saved_gateway_ip, sizeof(gateway_ip));
+    arp_requests_dropped = saved_requests_dropped;
+
+    return passed;
 }
 
 /**
@@ -718,6 +922,27 @@ static bool is_valid_arp_ip(const uint8_t* ip) {
     return true;
 }
 
+static bool is_zero_mac(const uint8_t* mac) {
+    return mac[0] == 0 && mac[1] == 0 && mac[2] == 0 &&
+           mac[3] == 0 && mac[4] == 0 && mac[5] == 0;
+}
+
+static bool is_valid_arp_sender_mac(const uint8_t* mac) {
+    if (is_zero_mac(mac)) {
+        return false;
+    }
+
+    if ((mac[0] & 0x01) != 0) {
+        return false;
+    }
+
+    if (memcmp(mac, my_mac, 6) == 0) {
+        return false;
+    }
+
+    return true;
+}
+
 /**
  * @brief Handles an incoming ARP packet.
  * @param arp_hdr Pointer to the ARP header.
@@ -744,7 +969,8 @@ static void handle_arp(arp_header_t* arp_hdr, eth_header_t* eth_hdr) {
      * - Validate operation field (REQUEST or REPLY only)
      * - Reject invalid sender IPs (broadcast, multicast, loopback)
      * - Only cache IPs in our subnet or configured gateway
-     * - Only update cache for replies to our pending requests
+     * - Only replace an existing mapping after a pending request
+     * - Only learn the gateway after a pending request
      *
      * REFERENCES:
      * - RFC 826: Ethernet Address Resolution Protocol
@@ -784,9 +1010,8 @@ static void handle_arp(arp_header_t* arp_hdr, eth_header_t* eth_hdr) {
         return;
     }
 
-    /* Validate sender MAC is not broadcast or multicast */
-    if ((arp_hdr->sender_mac[0] & 0x01) != 0) {
-        /* Multicast or broadcast MAC - invalid for ARP sender */
+    /* Validate sender MAC is unicast, non-zero, and not ours */
+    if (!is_valid_arp_sender_mac(arp_hdr->sender_mac)) {
         return;
     }
 
@@ -850,25 +1075,11 @@ static void handle_arp(arp_header_t* arp_hdr, eth_header_t* eth_hdr) {
 
         bool should_update = false;
 
-        /* Check if we have a pending request for this IP */
-        for (int i = 0; i < ARP_MAX_PENDING_REQUESTS; i++) {
-            if (arp_pending_requests[i].pending &&
-                memcmp(arp_pending_requests[i].ip, arp_hdr->sender_ip, 4) == 0) {
-                should_update = true;
-                arp_pending_requests[i].pending = false;
-                break;
-            }
-        }
+        should_update = arp_pending_request_matches(arp_hdr->sender_ip);
 
         /* Check if IP is already in cache (update existing entry) */
-        if (!should_update) {
-            for (int i = 0; i < ARP_CACHE_SIZE; i++) {
-                if (arp_cache[i].valid &&
-                    memcmp(arp_cache[i].ip, arp_hdr->sender_ip, 4) == 0) {
-                    should_update = true;
-                    break;
-                }
-            }
+        if (!should_update && arp_cache_contains_ip(arp_hdr->sender_ip)) {
+            should_update = true;
         }
 
         /* Update cache only if validated */
@@ -1124,23 +1335,7 @@ static void handle_ip(uint8_t* eth_frame, ip_header_t* ip_hdr, size_t eth_len, s
         return;
     }
 
-    /*=========================================================================
-     * ARP CACHE LEARNING: Update cache from incoming IP packets
-     * CRITICAL: Learn MAC addresses from all IP packets, not just ARP
-     * When we receive an IP packet, the Ethernet header contains the sender's
-     * MAC address. We should cache this mapping (IP → MAC) so we can send
-     * responses without needing to do ARP resolution.
-     *
-     * This is especially important for TCP server connections:
-     * 1. Client sends TCP SYN (contains source IP + MAC in Ethernet header)
-     * 2. Server wants to send SYN-ACK back
-     * 3. Needs MAC address for client IP
-     * 4. If we learned it from the Ethernet header → immediate response ✅
-     * 5. If not learned → ARP request needed → delayed response ❌
-     *=======================================================================*/
-    // Removed verbose ARP learning logs to reduce console noise
     eth_header_t* eth_hdr = (eth_header_t*)eth_frame;
-    arp_cache_update(ip_hdr->src_ip, eth_hdr->src_mac);
 
     // Validate IP header doesn't exceed packet length
     uint16_t total_len = ntohs(ip_hdr->total_length);
@@ -1381,13 +1576,15 @@ static void handle_ip(uint8_t* eth_frame, ip_header_t* ip_hdr, size_t eth_len, s
         case IPPROTO_ICMP: {
             /*
              * ICMP requires at least 8 bytes: type(1) + code(1) + checksum(2) + rest(4)
-             * If payload_len == 0, this is an invalid ICMP packet → DROP
+             * Shorter packets are invalid ICMP packets → DROP
              */
-            if (payload_len == 0) {
+            if (payload_len < 8) {
                 // kprintf("IP: Dropping zero-length ICMP packet (total_len=%d, header_len=%d)\n",
                 //         total_len, ip_hdr_len_bytes);
                 return;  // Drop silently - likely malformed or padding-only
             }
+
+            arp_cache_update(ip_hdr->src_ip, eth_hdr->src_mac);
 
             // Call context-aware ICMP handler that can send Echo Replies
             // Use validated ip_hdr_len_bytes from security check above
@@ -1406,23 +1603,25 @@ static void handle_ip(uint8_t* eth_frame, ip_header_t* ip_hdr, size_t eth_len, s
         case IPPROTO_UDP:
             /*
              * UDP requires at least 8 bytes: src_port(2) + dst_port(2) + len(2) + checksum(2)
-             * If payload_len == 0, this is an invalid UDP packet → DROP
+             * Shorter packets are invalid UDP packets → DROP
              */
-            if (payload_len == 0) {
+            if (payload_len < sizeof(udp_header_t)) {
                 // kprintf("IP: Dropping zero-length UDP packet\n");
                 return;
             }
+            arp_cache_update(ip_hdr->src_ip, eth_hdr->src_mac);
             handle_udp(ip_hdr, total_len);
             break;
         case IPPROTO_TCP:
             /*
              * TCP requires at least 20 bytes for minimal header
-             * If payload_len == 0, this is an invalid TCP packet → DROP
+             * Shorter packets are invalid TCP packets → DROP
              */
-            if (payload_len == 0) {
+            if (payload_len < sizeof(tcp_header_t)) {
                 // kprintf("IP: Dropping zero-length TCP packet\n");
                 return;
             }
+            arp_cache_update(ip_hdr->src_ip, eth_hdr->src_mac);
             handle_tcp(ip_hdr, total_len);
             break;
         default:
@@ -1713,4 +1912,3 @@ void net_init() {
      *=======================================================================*/
     icmp_init();
 }
-
