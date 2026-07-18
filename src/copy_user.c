@@ -11,6 +11,7 @@
  *============================================================================*/
 #include "copy_user.h"
 #include "memory.h"
+#include "paging.h"
 #include "errno.h"
 #include "critical.h"  /* For CRITICAL_SECTION_ENTER/EXIT */
 #include <stdint.h>
@@ -158,6 +159,14 @@ int copy_from_user(void* kernel_dst, const void* user_src, size_t len) {
         return -EFAULT;
     }
 
+    /* A CPL0 load can read supervisor mappings, so fault probing alone cannot
+     * establish that the caller supplied a genuine user page. Validate the
+     * U/S bits in the active address space before dereferencing any byte. */
+    if (!pae_user_range_accessible(user_addr, len, false)) {
+        CRITICAL_SECTION_EXIT();
+        return -EFAULT;
+    }
+
     /*=========================================================================
      * SECURITY FIX (AUDIT 4B): Atomic Pre-Validation to Prevent Partial Faulting
      *=========================================================================
@@ -195,8 +204,6 @@ int copy_from_user(void* kernel_dst, const void* user_src, size_t len) {
      * - If probe faults, handle_copy_user_fault() returns -EFAULT
      * - Only after all probes succeed do we start actual copy
      *=======================================================================*/
-    #define PAGE_SIZE 4096
-
     copy_ctx.active = true;
     copy_ctx.error_code = 0;
     copy_ctx.fault_addr = 0;
@@ -278,16 +285,9 @@ int copy_from_user(void* kernel_dst, const void* user_src, size_t len) {
      * This may trigger a page fault if user unmaps memory concurrently
      * SECURITY: Page fault will be caught and return -EFAULT
      *
-     * PERMISSION VALIDATION (11.C): This implicitly validates PTE permissions
-     * through CPU's hardware memory protection:
-     * - If user page lacks READ permission, CPU generates #PF
-     * - If page is not present (unmapped), CPU generates #PF
-     * - Page fault handler detects copy_ctx.active and returns -EFAULT
-     *
-     * This approach is SUPERIOR to explicit PTE checks because:
-     * 1. Eliminates TOCTOU race (user can't change permissions between check/use)
-     * 2. CPU enforces permissions atomically via hardware
-     * 3. Handles all fault cases uniformly (not present, no permissions, etc.)
+     * Page permissions were checked above while interrupts were disabled.
+     * Fault recovery remains active as defense against an unexpected mapping
+     * change or inaccessible physical backing.
      *=======================================================================*/
     const uint8_t* src = (const uint8_t*)user_src;
     uint8_t* dst = (uint8_t*)kernel_dst;
@@ -367,6 +367,13 @@ int copy_to_user(void* user_dst, const void* kernel_src, size_t len) {
      *=======================================================================*/
     if (copy_ctx.active) {
         /* Nested copy_*_user() detected - this is a kernel bug */
+        CRITICAL_SECTION_EXIT();
+        return -EFAULT;
+    }
+
+    /* Supervisor writes do not enforce the U/S bit. Require a writable user
+     * mapping at both the PDE and PTE levels before touching the destination. */
+    if (!pae_user_range_accessible(user_addr, len, true)) {
         CRITICAL_SECTION_EXIT();
         return -EFAULT;
     }

@@ -11,6 +11,11 @@
 #include "entropy.h"
 #include "process.h"
 #include "scheduler.h"
+#include "copy_user.h"
+#include "paging.h"
+#include "pmm.h"
+#include "critical.h"
+#include "errno.h"
 #include "kprintf.h"
 #include "util.h"
 #include <stdint.h>
@@ -247,6 +252,125 @@ static void test_stack_canary(void) {
 }
 
 /*=============================================================================
+ * TEST 7: Hardened Usercopy Permission Enforcement
+ *=============================================================================*/
+static void test_hardened_usercopy(void) {
+    const uint32_t rw_addr = 0x70000000u;
+    const uint32_t ro_addr = rw_addr + PAGE_SIZE;
+    const uint32_t unmapped_addr = ro_addr + PAGE_SIZE;
+    uint32_t test_pdpt = 0;
+    uint32_t rw_frame = 0;
+    uint32_t ro_frame = 0;
+    bool passed = false;
+
+    kprintf("\n=====================================================\n");
+    kprintf("TEST 7: Hardened Usercopy Permissions\n");
+    kprintf("=====================================================\n");
+
+    test_pdpt = pae_create_user_pdpt();
+    rw_frame = pmm_alloc();
+    ro_frame = pmm_alloc();
+    if (!test_pdpt || !rw_frame || !ro_frame) {
+        kprintf("[USERCOPY] FAILED: unable to allocate test address space\n");
+        goto cleanup;
+    }
+
+    uint8_t* rw_page = (uint8_t*)(uintptr_t)rw_frame;
+    uint8_t* ro_page = (uint8_t*)(uintptr_t)ro_frame;
+    rw_page[0] = 0x41;
+    rw_page[PAGE_SIZE - 1] = 0x51;
+    ro_page[0] = 0x52;
+
+    pae_map_page_into(test_pdpt, rw_addr, rw_frame, PAE_PAGE_DATA);
+    pae_map_page_into(test_pdpt, ro_addr, ro_frame, PAE_PAGE_RODATA);
+
+    bool mapping_setup =
+        pae_user_range_accessible_in(test_pdpt, rw_addr, 1, true) &&
+        pae_user_range_accessible_in(test_pdpt, ro_addr, 1, false) &&
+        !pae_user_range_accessible_in(test_pdpt, ro_addr, 1, true);
+    if (!mapping_setup) {
+        kprintf("[USERCOPY] FAILED: test mappings were not installed\n");
+        goto cleanup;
+    }
+
+    uint32_t saved_cr3;
+    __asm__ volatile("mov %%cr3, %0" : "=r"(saved_cr3));
+    uint32_t irq_flags = disable_interrupts();
+    __asm__ volatile("mov %0, %%cr3" :: "r"(test_pdpt) : "memory");
+
+    uint8_t value = 0;
+    uint8_t pair[2] = {0, 0};
+    uint8_t write_value = 0x42;
+    uint8_t cross_write[2] = {0x61, 0x62};
+    uint8_t overflow_buffer[32] = {0};
+
+    bool rw_read = copy_from_user(&value, (const void*)rw_addr, 1) == 0 &&
+                   value == 0x41;
+    bool rw_write = copy_to_user((void*)rw_addr, &write_value, 1) == 0;
+    bool ro_read = copy_from_user(&value, (const void*)ro_addr, 1) == 0 &&
+                   value == 0x52;
+    bool ro_write_rejected =
+        copy_to_user((void*)ro_addr, &write_value, 1) == -EFAULT;
+    bool cross_read =
+        copy_from_user(pair, (const void*)(rw_addr + PAGE_SIZE - 1), 2) == 0 &&
+        pair[0] == 0x51 && pair[1] == 0x52;
+    bool cross_write_rejected =
+        copy_to_user((void*)(rw_addr + PAGE_SIZE - 1), cross_write, 2) == -EFAULT;
+    bool unmapped_rejected =
+        copy_from_user(&value, (const void*)unmapped_addr, 1) == -EFAULT;
+    bool supervisor_read_rejected =
+        copy_from_user(&value, (const void*)(uintptr_t)rw_frame, 1) == -EFAULT;
+    bool supervisor_write_rejected =
+        copy_to_user((void*)(uintptr_t)rw_frame, &write_value, 1) == -EFAULT;
+    bool boundary_rejected =
+        copy_from_user(overflow_buffer, (const void*)0xBFFFFFF0u,
+                       sizeof(overflow_buffer)) == -EFAULT;
+    bool overflow_rejected =
+        copy_from_user(overflow_buffer, (const void*)0xFFFFFFF0u,
+                       sizeof(overflow_buffer)) == -EFAULT;
+
+    __asm__ volatile("mov %0, %%cr3" :: "r"(saved_cr3) : "memory");
+    restore_interrupts(irq_flags);
+
+    bool no_partial_write = rw_page[PAGE_SIZE - 1] == 0x51 && ro_page[0] == 0x52;
+    bool write_reached_frame = rw_page[0] == write_value;
+
+    passed = rw_read && rw_write && write_reached_frame && ro_read &&
+             ro_write_rejected && cross_read && cross_write_rejected &&
+             no_partial_write && unmapped_rejected &&
+             supervisor_read_rejected && supervisor_write_rejected &&
+             boundary_rejected && overflow_rejected;
+
+    kprintf("[USERCOPY] Writable user page:       %s\n",
+            (rw_read && rw_write && write_reached_frame) ? "PASSED" : "FAILED");
+    kprintf("[USERCOPY] Read-only enforcement:    %s\n",
+            (ro_read && ro_write_rejected) ? "PASSED" : "FAILED");
+    kprintf("[USERCOPY] Cross-page atomicity:     %s\n",
+            (cross_read && cross_write_rejected && no_partial_write) ? "PASSED" : "FAILED");
+    kprintf("[USERCOPY] Unmapped page rejection:  %s\n",
+            unmapped_rejected ? "PASSED" : "FAILED");
+    kprintf("[USERCOPY] Supervisor page rejection:%s\n",
+            (supervisor_read_rejected && supervisor_write_rejected) ? " PASSED" : " FAILED");
+    kprintf("[USERCOPY] Range bounds rejection:   %s\n",
+            (boundary_rejected && overflow_rejected) ? "PASSED" : "FAILED");
+
+cleanup:
+    if (test_pdpt) {
+        pae_free_user_pdpt(test_pdpt);
+    }
+    if (rw_frame) {
+        pmm_free(rw_frame);
+    }
+    if (ro_frame) {
+        pmm_free(ro_frame);
+    }
+
+    kprintf("-----------------------------------------------------\n");
+    kprintf("TEST 7: %s\n", passed ? "PASSED" : "FAILED");
+    kprintf("=====================================================\n");
+}
+
+/*=============================================================================
  * Main Test Runner
  *=============================================================================*/
 void run_security_tests(void) {
@@ -272,6 +396,7 @@ void run_security_tests(void) {
     test_cleanup_queue();
     test_fpu_enforcement();
     test_stack_canary();
+    test_hardened_usercopy();
 
     kprintf("\n");
     kprintf("*************************************************************\n");

@@ -126,6 +126,7 @@ typedef uint64_t pae_pdpte_t;  /* Page Directory Pointer Table Entry (64 bits) *
 #define PAE_ACCESSED        (1ULL << 5)   /* Page has been accessed */
 #define PAE_DIRTY           (1ULL << 6)   /* Page has been written to */
 #define PAE_PAT             (1ULL << 7)   /* Page Attribute Table */
+#define PAE_LARGE_PAGE      (1ULL << 7)   /* PDE maps a 2 MiB page */
 #define PAE_GLOBAL          (1ULL << 8)   /* Global page (TLB not flushed on CR3 change) */
 
 /*=============================================================================
@@ -312,6 +313,26 @@ void pae_unmap_page_in(uint32_t pdpt_phys, uint32_t virt);
  * @return Pointer to PTE, or NULL if not mapped
  */
 pae_pte_t* pae_get_pte(uint32_t virt);
+
+/**
+ * @brief Check a range against user permissions in a specific PAE address space
+ *
+ * Every page must be present and have PAE_USER set at each permission-bearing
+ * level. When require_write is true, every level must also be writable.
+ *
+ * @param pdpt_phys Physical address of the target PDPT
+ * @param start First byte of the range
+ * @param len Number of bytes in the range
+ * @param require_write Whether write permission is required
+ * @return true only when the complete range is accessible from CPL 3
+ */
+bool pae_user_range_accessible_in(uint32_t pdpt_phys, uint32_t start,
+                                  size_t len, bool require_write);
+
+/**
+ * @brief Check a range against user permissions in the active PAE address space
+ */
+bool pae_user_range_accessible(uint32_t start, size_t len, bool require_write);
 
 /**
  * @brief Get PAE page directory entry in the current CR3
