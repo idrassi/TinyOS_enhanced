@@ -84,6 +84,17 @@ int scheduler_get_all_tasks(task_t*** tasks_out);
 void scheduler_schedule_from_interrupt(struct interrupt_regs* regs);
 
 /**
+ * @brief Terminate the current task from a CPU exception and force a switch
+ *
+ * This is for exceptions that originated from CPL 3. It never returns to the
+ * faulting task; if no replacement task can be scheduled, the kernel panics.
+ *
+ * @param regs Pointer to the exception register state
+ */
+void scheduler_terminate_current_from_interrupt(struct interrupt_regs* regs)
+    __attribute__((noreturn));
+
+/**
  * @brief Block a task (remove from ready queue, mark as BLOCKED)
  * Used by wait queues to put tasks to sleep
  *

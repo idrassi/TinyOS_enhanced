@@ -16,6 +16,8 @@
 #include "pmm.h"
 #include "critical.h"
 #include "errno.h"
+#include "memory.h"
+#include "kernel.h"
 #include "kprintf.h"
 #include "util.h"
 #include <stdint.h>
@@ -371,6 +373,96 @@ cleanup:
 }
 
 /*=============================================================================
+ * TEST 8: User Exception Containment
+ *=============================================================================*/
+static void test_user_exception_containment(void) {
+    const uint8_t fault_code[] = {
+        0x0f, 0x0b,  /* ud2 */
+        0xeb, 0xfe   /* jmp $ */
+    };
+    bool passed = false;
+    uint32_t code_frame = 0;
+    int pid = -1;
+    uint32_t generation = 0;
+
+    kprintf("\n");
+    kprintf("=====================================================\n");
+    kprintf("TEST 8: User Exception Containment\n");
+    kprintf("=====================================================\n");
+
+    code_frame = pmm_alloc();
+    if (!code_frame) {
+        kprintf("[EXCEPTION] FAILED: unable to allocate user code frame\n");
+        goto cleanup;
+    }
+
+    memset((void*)(uintptr_t)code_frame, 0, PAGE_SIZE);
+    memcpy((void*)(uintptr_t)code_frame, fault_code, sizeof(fault_code));
+
+    pid = task_create_user_ex(USER_CODE_BASE, "FaultUD2", USER_STACK_MIN);
+    if (pid < 0) {
+        kprintf("[EXCEPTION] FAILED: unable to create user fault task\n");
+        goto cleanup;
+    }
+
+    task_t* fault_task = task_get_any((uint32_t)pid);
+    if (!fault_task) {
+        kprintf("[EXCEPTION] FAILED: created task is not visible\n");
+        goto cleanup;
+    }
+    generation = fault_task->generation;
+
+    uint32_t saved_cr3;
+    __asm__ volatile("mov %%cr3, %0" : "=r"(saved_cr3));
+    uint32_t flags = disable_interrupts();
+    __asm__ volatile("mov %0, %%cr3" :: "r"(fault_task->page_directory) : "memory");
+    map_page(USER_CODE_BASE, code_frame, PAE_PAGE_CODE);
+    __asm__ volatile("mov %0, %%cr3" :: "r"(saved_cr3) : "memory");
+    restore_interrupts(flags);
+
+    if (pae_is_active()) {
+        uint64_t mapped = pae_virt_to_phys_in(fault_task->page_directory,
+                                              USER_CODE_BASE);
+        if ((mapped & PAE_FRAME_MASK) != code_frame) {
+            kprintf("[EXCEPTION] FAILED: user code page was not mapped\n");
+            goto cleanup;
+        }
+    }
+
+    scheduler_add_task(fault_task);
+
+    uint32_t start_ticks = get_timer_ticks();
+    while (get_timer_ticks() - start_ticks < 200) {
+        task_t* live = task_get_validated((uint32_t)pid, generation);
+        if (!live || live->state == TASK_STATE_TERMINATED) {
+            passed = true;
+            break;
+        }
+        scheduler_yield();
+    }
+
+    kprintf("[EXCEPTION] Faulting user task terminated: %s\n",
+            passed ? "PASSED" : "FAILED");
+    kprintf("[EXCEPTION] Kernel resumed after CPL3 #UD: %s\n",
+            passed ? "PASSED" : "FAILED");
+
+cleanup:
+    if (!passed && pid >= 0) {
+        task_t* task = task_get_any((uint32_t)pid);
+        if (task && task->state != TASK_STATE_TERMINATED) {
+            task_terminate((uint32_t)pid);
+        }
+    }
+    if (code_frame) {
+        pmm_free(code_frame);
+    }
+
+    kprintf("-----------------------------------------------------\n");
+    kprintf("TEST 8: %s\n", passed ? "PASSED" : "FAILED");
+    kprintf("=====================================================\n");
+}
+
+/*=============================================================================
  * Main Test Runner
  *=============================================================================*/
 void run_security_tests(void) {
@@ -397,6 +489,7 @@ void run_security_tests(void) {
     test_fpu_enforcement();
     test_stack_canary();
     test_hardened_usercopy();
+    test_user_exception_containment();
 
     kprintf("\n");
     kprintf("*************************************************************\n");

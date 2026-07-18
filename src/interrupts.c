@@ -69,6 +69,18 @@ static const char* exc_name[32] = {
     "Reserved"                    /* Intel reserved */
 };
 
+static bool exception_can_kill_user_task(uint32_t vector)
+{
+    switch (vector) {
+        case 2:   /* NMI */
+        case 8:   /* Double Fault */
+        case 18:  /* Machine Check */
+            return false;
+        default:
+            return true;
+    }
+}
+
 static volatile uint32_t timer_ticks = 0;
 
 /* Bottom-half (softirq) deferral: the timer ISR sets this; timer_softirq_run()
@@ -214,6 +226,28 @@ void isr_common_handler(interrupt_regs_t* regs)
             /* Return to interrupted code - FPU is now available */
             interrupt_context_exit();
             return;
+        }
+
+        if ((regs->cs & 0x3) == 0x3 && exception_can_kill_user_task(vector)) {
+            task_t* current = task_current();
+            uint16_t uid = current ? current->uid : 0;
+            uint16_t pid = current ? current->pid : 0;
+
+            audit_log(AUDIT_SEC_EXPLOIT_ATTEMPT, AUDIT_ERROR, uid,
+                      "Contained user exception: PID=%u vector=%u %s eip=0x%08x err=0x%x",
+                      pid, (unsigned int)vector, exc_name[vector],
+                      (unsigned int)regs->eip, (unsigned int)err);
+
+            kprintf("[EXCEPTION] Containing user exception: PID=%u '%s' %s "
+                    "EIP=0x%08x ERR=0x%08x\n",
+                    (unsigned int)pid,
+                    current ? current->name : "<unknown>",
+                    exc_name[vector],
+                    (unsigned int)regs->eip,
+                    (unsigned int)err);
+
+            interrupt_context_exit();
+            scheduler_terminate_current_from_interrupt(regs);
         }
 
         /*=====================================================================

@@ -1121,6 +1121,62 @@ void scheduler_schedule_from_interrupt(interrupt_regs_t* regs) {
 }
 
 /*=============================================================================
+ * FUNCTION: scheduler_terminate_current_from_interrupt
+ * PURPOSE: Kill the current CPL3 task from an exception handler.
+ *
+ * The faulting task is executing on its own kernel stack inside an interrupt
+ * frame. Freeing that stack immediately is unsafe, so we unlink the task from
+ * the ready queue, enqueue it for the normal post-switch reaper, and switch to
+ * another runnable task through the same context_switch path used by IRQ
+ * preemption. Returning to the faulting IRET frame is never allowed.
+ *=============================================================================*/
+void scheduler_terminate_current_from_interrupt(interrupt_regs_t* regs) {
+    (void)regs;
+
+    uint32_t irq_flags = disable_interrupts();
+
+    if (!scheduler_enabled || !current_running_task) {
+        restore_interrupts(irq_flags);
+        kernel_panic("User exception without a running task");
+    }
+
+    task_t* prev_task = (task_t*)current_running_task;
+    if (!task_slot_is_live(prev_task)) {
+        restore_interrupts(irq_flags);
+        kernel_panic("User exception on stale task slot");
+    }
+    if (prev_task->is_kernel_task) {
+        restore_interrupts(irq_flags);
+        kernel_panic("Kernel task routed to user exception termination");
+    }
+
+    prev_task->state = TASK_STATE_TERMINATED;
+    prev_task->ticks_remaining = 0;
+    scheduler_remove_task_locked(prev_task);
+
+    if (!cleanup_queue_enqueue(prev_task)) {
+        kprintf("[SCHEDULER] WARNING: Failed to enqueue exception-killed "
+                "task PID=%d for cleanup\n", prev_task->pid);
+    }
+
+    task_t* next_task = scheduler_get_next_task();
+    if (!next_task || next_task == prev_task) {
+        restore_interrupts(irq_flags);
+        kernel_panic("No runnable task after user exception");
+    }
+
+    next_task->state = TASK_STATE_RUNNING;
+    next_task->ticks_remaining = next_task->time_slice;
+    next_task->has_run_before = true;
+    current_running_task = next_task;
+    total_context_switches++;
+
+    scheduler_switch_kernel_context(prev_task, next_task);
+
+    kernel_panic("Returned to exception-terminated task");
+}
+
+/*=============================================================================
  * FUNCTION: scheduler_get_all_tasks
  * PURPOSE: Get all active tasks in the system
  *
